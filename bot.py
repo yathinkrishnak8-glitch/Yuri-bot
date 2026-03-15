@@ -9,11 +9,8 @@ import random
 import time
 import asyncio
 import datetime
-import json
-import secrets
-from typing import List, Dict, Any, Optional
 
-# NEW GOOGLE SDK IMPORTS
+# NEW GOOGLE SDK
 from google import genai
 from google.genai import types
 
@@ -23,12 +20,11 @@ TOTAL_QUERIES = 0
 DB_LOCK = threading.Lock()
 DB_PATH = "yoai.db"
 
-# Load Gemini API keys from environment variable (comma-separated)
+# Load Gemini API keys (comma-separated, 10 keys)
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 if not GEMINI_KEYS or GEMINI_KEYS == [""]:
     raise ValueError("GEMINI_API_KEYS environment variable not set or empty")
 
-# Flask secret key (Static fallback so sessions survive Render reboots)
 FLASK_SECRET = os.environ.get("FLASK_SECRET", "yoai_persistent_secret_key_123")
 PORT = int(os.environ.get("PORT", 5000))
 
@@ -52,25 +48,21 @@ init_db()
 
 # -------------------- Enterprise Gemini Load Balancer --------------------
 class GeminiKeyManager:
-    def __init__(self, keys: List[str]):
-        self.keys = keys
+    def __init__(self, keys: list):
+        self.keys = [k.strip() for k in keys if k.strip()]
     
     def count(self) -> int:
         return len(self.keys)
     
-    def generate_with_fallback(self, model_name: str, contents: Any, system_instruction: Optional[str] = None, max_retries: Optional[int] = None) -> str:
-        if max_retries is None:
-            max_retries = len(self.keys) 
-        
+    def generate_with_fallback(self, model_name: str, contents: str, system_instruction: str = None) -> str:
+        max_retries = len(self.keys)
         shuffled_keys = random.sample(self.keys, len(self.keys))
         last_error = None
         
         for attempt, key in enumerate(shuffled_keys[:max_retries]):
             try:
                 client = genai.Client(api_key=key)
-                config = None
-                if system_instruction:
-                    config = types.GenerateContentConfig(system_instruction=system_instruction)
+                config = types.GenerateContentConfig(system_instruction=system_instruction) if system_instruction else None
                 
                 response = client.models.generate_content(
                     model=model_name,
@@ -80,10 +72,10 @@ class GeminiKeyManager:
                 return response.text
             except Exception as e:
                 last_error = e
-                print(f"Key {key[:8]}... failed (attempt {attempt+1}/{max_retries}): {e}")
+                print(f"Key {key[:8]}... failed: {e}")
                 continue
         
-        raise last_error or Exception("All Gemini keys failed")
+        raise last_error or Exception("All 10 Gemini keys failed.")
 
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
@@ -122,7 +114,7 @@ def set_user_personality(user_id: int, preset: str):
         conn.commit()
         conn.close()
 
-def is_channel_allowed(guild_id: Optional[int], channel_id: int) -> bool:
+def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None:  
         return True
     with DB_LOCK:
@@ -157,6 +149,8 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
                   (channel_id, message_id, author_id, content, timestamp))
         c.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,))
         count = c.fetchone()[0]
+        
+        # Context Compression
         if count > 20:
             c.execute("""SELECT message_id, author_id, content, timestamp FROM message_history 
                          WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
@@ -164,42 +158,31 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
             if oldest:
                 texts = [f"User {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
                 if texts:
-                    summary_text = summarize_with_gemini("\n".join(texts))
+                    try:
+                        summary_text = key_manager.generate_with_fallback('gemini-1.5-flash', f"Summarize concisely:\n{chr(10).join(texts)}")
+                    except:
+                        summary_text = "[Summary unavailable]"
+                    
                     oldest_ids = [mid for mid, _, _, _ in oldest]
                     c.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
-                    summary_timestamp = oldest[0][3]
                     c.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)",
-                              (channel_id, -1, summary_text, summary_timestamp)) 
+                              (channel_id, -1, summary_text, oldest[0][3])) 
         conn.commit()
         conn.close()
-
-def get_channel_history(channel_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("""SELECT author_id, content, timestamp FROM message_history 
-                     WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT ?""", (channel_id, limit))
-        rows = c.fetchall()
-        conn.close()
-        return [{"author_id": row[0], "content": row[1], "timestamp": row[2]} for row in rows]
-
-def summarize_with_gemini(text: str) -> str:
-    try:
-        return key_manager.generate_with_fallback(
-            model_name='gemini-1.5-flash',
-            contents=f"Summarize the following conversation concisely, preserving key points:\n{text}",
-            max_retries=key_manager.count()  
-        )
-    except Exception as e:
-        print(f"Summarization error after fallback: {e}")
-        return "[Summary unavailable]"
 
 async def generate_ai_response(channel_id: int, user_message: str, author_id: int) -> str:
     global TOTAL_QUERIES
     TOTAL_QUERIES += 1
 
-    history = get_channel_history(channel_id, limit=20)
-    context = "".join([f"[Summary]: {msg['content']}\n" if msg["author_id"] == 0 else f"User {msg['author_id']}: {msg['content']}\n" for msg in history])
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("""SELECT author_id, content FROM message_history 
+                     WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 20""", (channel_id,))
+        history = c.fetchall()
+        conn.close()
+    
+    context = "".join([f"[Summary]: {cnt}\n" if aid == 0 else f"User {aid}: {cnt}\n" for aid, cnt in history])
     context += f"User {author_id}: {user_message}\nYoAI:"
 
     system = get_system_prompt()
@@ -210,20 +193,16 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
         system += " Respond like a tsundere anime character. You pretend not to care about the user but actually do. Call them 'baka'."
 
     try:
-        return key_manager.generate_with_fallback(
-            model_name='gemini-1.5-flash',
-            contents=context,
-            system_instruction=system,
-            max_retries=key_manager.count()  
-        )
+        return key_manager.generate_with_fallback('gemini-1.5-flash', context, system)
     except Exception as e:
         print(f"AI error: {e}")
-        return "I'm having trouble thinking right now. Please try again later."
+        return "System failure. Could not connect to the AI mainframe."
 
 # -------------------- Discord Bot --------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
+intents.messages = True
 
 class YoAIBot(commands.Bot):
     def __init__(self):
@@ -272,7 +251,7 @@ async def hack(interaction: discord.Interaction, user: discord.User):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def info(interaction: discord.Interaction):
     uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     embed = discord.Embed(title="YoAI | Domain Expansion", color=0xa855f7)
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
@@ -281,42 +260,64 @@ async def info(interaction: discord.Interaction):
     embed.set_footer(text="Limitless Protocol Active")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="setchannel", description="Allow/Disallow bot auto-reply in this channel (Admin only)")
+@bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 @app_commands.default_permissions(manage_channels=True)
-async def setchannel(interaction: discord.Interaction, enabled: bool):
-    if not interaction.guild:
-        await interaction.response.send_message("This command can only be used in servers.", ephemeral=True)
-        return
-    if enabled:
-        add_allowed_channel(interaction.guild_id, interaction.channel.id)
-        await interaction.response.send_message(f"⚙️ YoAI System is now listening to {interaction.channel.mention}", ephemeral=True)
-    else:
-        remove_allowed_channel(interaction.guild_id, interaction.channel.id)
-        await interaction.response.send_message(f"❌ YoAI System is ignoring {interaction.channel.mention}", ephemeral=True)
+async def setchannel(interaction: discord.Interaction):
+    add_allowed_channel(interaction.guild_id, interaction.channel.id)
+    await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}", ephemeral=True)
 
-# -------------------- Message Handling --------------------
+@bot.tree.command(name="unsetchannel", description="Stop YoAI from automatically replying in this channel.")
+@app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
+@app_commands.default_permissions(manage_channels=True)
+async def unsetchannel(interaction: discord.Interaction):
+    remove_allowed_channel(interaction.guild_id, interaction.channel.id)
+    await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
+
+# -------------------- DM & Server Message Routing --------------------
 @bot.event
 async def on_message(message: discord.Message):
+    # Ignore the bot's own messages
     if message.author == bot.user:
         return
 
-    add_message_to_history(
-        channel_id=message.channel.id, message_id=message.id,
-        author_id=message.author.id, content=message.content,
-        timestamp=int(message.created_at.timestamp())
-    )
+    # 1. Determine the context (DM vs Server)
+    is_dm = message.guild is None
+    is_mentioned = bot.user in message.mentions
+    
+    is_allowed_server_channel = False
+    if not is_dm:
+        is_allowed_server_channel = is_channel_allowed(message.guild.id, message.channel.id)
 
+    # 2. Decide if the bot should reply based on context rules
     should_reply = False
-    if message.guild is None or is_channel_allowed(message.guild.id, message.channel.id):
-        should_reply = True
+    if is_dm:
+        should_reply = True # Always reply in DMs
+    elif is_mentioned or is_allowed_server_channel:
+        should_reply = True # Reply in servers if mentioned or in a /setchannel
 
     if should_reply:
+        # Clean the text (remove the @mention tag if it exists so the AI doesn't read its own ID)
+        clean_content = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
+        
+        # Fallback if someone pings the bot but doesn't type anything
+        if not clean_content:
+            clean_content = "Hello! You pinged me?"
+
+        # Save to the isolated memory for this specific channel/DM
+        add_message_to_history(
+            channel_id=message.channel.id, message_id=message.id,
+            author_id=message.author.id, content=clean_content,
+            timestamp=int(message.created_at.timestamp())
+        )
+
+        # Generate and send the response
         async with message.channel.typing():
-            response = await generate_ai_response(message.channel.id, message.content, message.author.id)
+            response = await generate_ai_response(message.channel.id, clean_content, message.author.id)
             for i in range(0, len(response), 2000):
                 await message.reply(response[i:i+2000], mention_author=False)
 
+    # Make sure slash commands still work
     await bot.process_commands(message)
 
 # -------------------- Flask Web Dashboard (Domain Expansion) --------------------
@@ -341,6 +342,7 @@ HTML_TEMPLATE = """
         body { 
             margin: 0; padding: 0; font-family: 'Space Grotesk', sans-serif;
             color: var(--text); height: 100vh; overflow: hidden; display: flex;
+            background-color: #0f172a;
         }
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
@@ -385,6 +387,9 @@ HTML_TEMPLATE = """
         button:hover { box-shadow: 0 0 20px rgba(168, 85, 247, 0.6); transform: scale(1.02); }
         .logout-btn { background: rgba(239, 68, 68, 0.2); border: 1px solid #ef4444; color: #ef4444; margin-top: 20px;}
         .logout-btn:hover { background: #ef4444; color: white; box-shadow: 0 0 20px rgba(239, 68, 68, 0.6);}
+        
+        .hidden { display: none !important; }
+        .visible-flex { display: flex !important; }
     </style>
 </head>
 <body>
@@ -392,17 +397,17 @@ HTML_TEMPLATE = """
         <source src="https://cdn.pixabay.com/video/2020/05/25/40131-424823903_large.mp4" type="video/mp4">
     </video>
 
-    <div id="login-overlay" class="glass">
+    <div id="login-overlay" class="glass visible-flex">
         <div class="login-box glass">
             <h1>Domain Expansion</h1>
             <p style="color: #cbd5e1; letter-spacing: 1px;">REMOVE THE BLINDFOLD</p>
             <input type="password" id="pwd" placeholder="Enter Cursed Passcode">
             <button onclick="login()">Initialize</button>
-            <p id="err" style="color: #ef4444; display: none; margin-top: 15px;">Access Denied. Weak Cursed Energy.</p>
+            <p id="err" style="color: #ef4444; display: none; margin-top: 15px;">Access Denied.</p>
         </div>
     </div>
 
-    <div id="dashboard-view" style="display: none; width: 100%; height: 100%; display: flex;">
+    <div id="dashboard-view" class="hidden" style="width: 100%; height: 100%;">
         <div id="nav" class="glass">
             <h2 style="margin: 0;">YoAI</h2>
             <div class="hide-mobile" style="opacity: 0.7; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 2px;">Infinite Void</div>
@@ -437,6 +442,20 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        function showDashboard() {
+            document.getElementById('login-overlay').classList.remove('visible-flex');
+            document.getElementById('login-overlay').classList.add('hidden');
+            document.getElementById('dashboard-view').classList.remove('hidden');
+            document.getElementById('dashboard-view').classList.add('visible-flex');
+        }
+
+        function showLogin() {
+            document.getElementById('dashboard-view').classList.remove('visible-flex');
+            document.getElementById('dashboard-view').classList.add('hidden');
+            document.getElementById('login-overlay').classList.remove('hidden');
+            document.getElementById('login-overlay').classList.add('visible-flex');
+        }
+
         async function login() {
             const pwd = document.getElementById('pwd').value;
             const res = await fetch('/login', {
@@ -445,8 +464,7 @@ HTML_TEMPLATE = """
                 body: JSON.stringify({ password: pwd })
             });
             if (res.ok) {
-                document.getElementById('login-overlay').style.display = 'none';
-                document.getElementById('dashboard-view').style.display = 'flex';
+                showDashboard();
                 fetchStats();
                 setInterval(fetchStats, 3000);
             } else {
@@ -463,26 +481,24 @@ HTML_TEMPLATE = """
                 document.getElementById('queries').innerText = data.total_queries;
                 document.getElementById('memory').innerText = data.active_memory_rows;
             } catch (e) {
-                document.getElementById('login-overlay').style.display = 'flex';
-                document.getElementById('dashboard-view').style.display = 'none';
+                showLogin();
             }
         }
 
         async function logout() {
             await fetch('/logout', { method: 'POST' });
-            document.getElementById('login-overlay').style.display = 'flex';
-            document.getElementById('dashboard-view').style.display = 'none';
+            showLogin();
             document.getElementById('pwd').value = '';
         }
 
         window.onload = async () => {
-            document.getElementById('dashboard-view').style.display = 'none';
             const res = await fetch('/api/stats');
             if (res.ok) {
-                document.getElementById('login-overlay').style.display = 'none';
-                document.getElementById('dashboard-view').style.display = 'flex';
+                showDashboard();
                 fetchStats();
                 setInterval(fetchStats, 3000);
+            } else {
+                showLogin();
             }
         };
     </script>
@@ -512,7 +528,7 @@ def api_stats():
     if not session.get('logged_in'):
         return jsonify(error="Unauthorized"), 401
     uptime_seconds = int(time.time() - START_TIME)
-    uptime_str = str(datetime.timedelta(seconds=uptime_seconds))
+    uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -520,7 +536,7 @@ def api_stats():
         rows = c.fetchone()[0]
         conn.close()
     return jsonify({
-        "uptime": uptime_str.split(".")[0], # Cleaned up the decimals
+        "uptime": uptime_str,
         "total_queries": TOTAL_QUERIES,
         "active_memory_rows": rows
     })
