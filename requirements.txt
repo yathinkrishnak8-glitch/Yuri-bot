@@ -1,4 +1,4 @@
 discord.py>=2.4.0
-google-generativeai
+google-genai
 flask
 audioop-lts
