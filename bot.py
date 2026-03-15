@@ -1,7 +1,6 @@
 import discord
 from discord import app_commands
 from discord.ext import commands
-import google.generativeai as genai
 from flask import Flask, request, session, jsonify, render_template_string
 import threading
 import sqlite3
@@ -14,6 +13,10 @@ import json
 import secrets
 from typing import List, Dict, Any, Optional
 
+# NEW GOOGLE SDK IMPORTS
+from google import genai
+from google.genai import types
+
 # -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
 TOTAL_QUERIES = 0
@@ -25,8 +28,8 @@ GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 if not GEMINI_KEYS or GEMINI_KEYS == [""]:
     raise ValueError("GEMINI_API_KEYS environment variable not set or empty")
 
-# Fixed Session Quirk: Hardcoded fallback so sessions survive Render reboots
-FLASK_SECRET = os.environ.get("FLASK_SECRET", "yoai_persistent_secret_key_123")
+# Flask secret key (random per run, but can be overridden via env for production)
+FLASK_SECRET = os.environ.get("FLASK_SECRET", secrets.token_hex(32))
 
 # Render provides PORT env var
 PORT = int(os.environ.get("PORT", 5000))
@@ -37,52 +40,52 @@ def init_db():
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
-        # Global configuration (key-value)
         c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        # User personality presets
         c.execute("CREATE TABLE IF NOT EXISTS user_personality (user_id INTEGER PRIMARY KEY, preset TEXT)")
-        # Allowed channels per guild for auto-reply
         c.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
-        # Message history per channel (for context compression)
         c.execute("""CREATE TABLE IF NOT EXISTS message_history (
             channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
             content TEXT, timestamp INTEGER
         )""")
-        # Insert default system prompt if not present
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a helpful AI assistant.')")
         conn.commit()
         conn.close()
 
 init_db()
 
-# -------------------- Gemini Load Balancer with Retry --------------------
+# -------------------- Gemini Load Balancer with Full Key Fallback --------------------
 class GeminiKeyManager:
     def __init__(self, keys: List[str]):
         self.keys = keys
     
-    def get_random_key(self) -> str:
-        return random.choice(self.keys)
-    
     def count(self) -> int:
         return len(self.keys)
     
-    def generate_with_fallback(self, model_name: str, contents: Any, system_instruction: Optional[str] = None, max_retries: int = 3) -> str:
-        """
-        Attempt to generate content using a random key. If it fails, try another key.
-        Returns the generated text or raises exception if all keys fail.
-        """
+    def generate_with_fallback(self, model_name: str, contents: Any, system_instruction: Optional[str] = None, max_retries: Optional[int] = None) -> str:
+        if max_retries is None:
+            max_retries = len(self.keys) 
+        
         shuffled_keys = random.sample(self.keys, len(self.keys))
         last_error = None
         
         for attempt, key in enumerate(shuffled_keys[:max_retries]):
             try:
-                genai.configure(api_key=key)
-                model = genai.GenerativeModel(model_name, system_instruction=system_instruction)
-                response = model.generate_content(contents)
+                # UPDATED TO NEW SDK SYNTAX
+                client = genai.Client(api_key=key)
+                
+                config = None
+                if system_instruction:
+                    config = types.GenerateContentConfig(system_instruction=system_instruction)
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                )
                 return response.text
             except Exception as e:
                 last_error = e
-                print(f"Key {key[:8]}... failed (attempt {attempt+1}): {e}")
+                print(f"Key {key[:8]}... failed (attempt {attempt+1}/{max_retries}): {e}")
                 continue
         
         raise last_error or Exception("All Gemini keys failed")
@@ -125,7 +128,7 @@ def set_user_personality(user_id: int, preset: str):
         conn.close()
 
 def is_channel_allowed(guild_id: Optional[int], channel_id: int) -> bool:
-    if guild_id is None:
+    if guild_id is None:  
         return True
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -193,7 +196,7 @@ def summarize_with_gemini(text: str) -> str:
         return key_manager.generate_with_fallback(
             model_name='gemini-1.5-flash',
             contents=f"Summarize the following conversation concisely, preserving key points:\n{text}",
-            max_retries=min(3, key_manager.count())
+            max_retries=key_manager.count()  
         )
     except Exception as e:
         print(f"Summarization error after fallback: {e}")
@@ -225,7 +228,7 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
             model_name='gemini-1.5-flash',
             contents=context,
             system_instruction=system,
-            max_retries=min(3, key_manager.count())
+            max_retries=key_manager.count()  
         )
         return response_text
     except Exception as e:
@@ -240,8 +243,7 @@ intents.guilds = True
 class YoAIBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
-        self.tree = app_commands.CommandTree(self)
-    
+
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
@@ -555,5 +557,5 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
-    # Fixed Discord Token variable name
+    # FIXED: Correct Render Variable
     bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
