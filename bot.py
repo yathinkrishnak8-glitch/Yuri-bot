@@ -172,7 +172,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.messages = True
-intents.members = True # Ensure we can fetch Display Names
+intents.members = True
 
 class YoAIBot(commands.Bot):
     def __init__(self):
@@ -217,14 +217,12 @@ async def generate_ai_response(channel_id: int, user_message: str, author: disco
         if aid == 0:
             context_str += f"[Summary]: {cnt}\n"
         else:
-            # FIXED: Grabs the actual Display Name of the user instead of their raw ID number!
             user_obj = bot.get_user(aid)
             name = user_obj.display_name if user_obj else "Unknown User"
             context_str += f"{name}: {cnt}\n"
             
     context_str += f"{author.display_name}: {user_message}\nYoAI:"
 
-    # Compile the final payload (Text + Images if any)
     payload = [context_str]
     if image_parts:
         payload.extend(image_parts)
@@ -344,7 +342,6 @@ async def on_message(message: discord.Message):
             timestamp=int(message.created_at.timestamp())
         )
 
-        # VISION: Process Images if the user attached any!
         image_parts = []
         if message.attachments:
             for att in message.attachments:
@@ -358,15 +355,12 @@ async def on_message(message: discord.Message):
                 for i in range(0, len(response), 2000):
                     await message.reply(response[i:i+2000], mention_author=False)
         except Exception as e:
-            # PUBLIC ERROR MESSAGE
             error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
             await message.reply(error_public, mention_author=False)
             
-            # DM MASTER ADMIN (Fetches the bot owner dynamically)
             try:
                 app_info = await bot.application_info()
                 admin_user = app_info.owner
-                
                 error_dm = (
                     f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
                     f"**Triggered By:** {message.author} (`{message.author.id}`)\n"
@@ -379,7 +373,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Seinen / Gemini UI) --------------------
+# -------------------- Flask Web Dashboard (Admin Panel & Telemetry) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
@@ -394,11 +388,12 @@ HTML_TEMPLATE = """
     <style>
         :root { 
             --bg-deep: #050505;
-            --glass: rgba(15, 15, 20, 0.75);
+            --glass: rgba(15, 15, 20, 0.85);
             --glass-border: rgba(255, 255, 255, 0.08);
             --text-main: #f3f4f6;
             --gemini-grad: linear-gradient(90deg, #4285f4, #9b72cb, #d96570);
             --accent-glow: rgba(155, 114, 203, 0.3);
+            --danger: #ef4444;
         }
         body { 
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
@@ -410,7 +405,7 @@ HTML_TEMPLATE = """
         }
         .glass {
             background: var(--glass);
-            backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+            backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
             border: 1px solid var(--glass-border);
             border-radius: 12px;
             box-shadow: 0 10px 40px rgba(0,0,0,0.8);
@@ -422,19 +417,23 @@ HTML_TEMPLATE = """
             font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
         }
 
-        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 10px; z-index: 10; margin: 20px; border-top: 3px solid #9b72cb; }
+        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-top: 3px solid #9b72cb; }
+        .nav-tab { padding: 12px 15px; border-radius: 8px; cursor: pointer; transition: 0.3s; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
+        .nav-tab:hover { background: rgba(255,255,255,0.05); }
+        .nav-tab.active { background: rgba(155, 114, 203, 0.2); border-color: rgba(155, 114, 203, 0.5); color: #fff; }
+
         #content { flex-grow: 1; padding: 40px 40px 40px 0; overflow-y: auto; z-index: 10; }
         
         @media (max-width: 768px) {
             body { flex-direction: column; }
-            #nav { width: auto; height: 70px; flex-direction: row; padding: 15px 25px; margin: 0; justify-content: space-between; align-items: center; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 20px 20px 0 0; border-top: 1px solid var(--glass-border); }
-            #content { padding: 25px; padding-bottom: 120px; margin: 0; }
+            #nav { width: auto; height: 80px; flex-direction: row; padding: 15px 25px; margin: 0; justify-content: space-around; align-items: center; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 20px 20px 0 0; border-top: 1px solid var(--glass-border); }
+            .nav-tab { padding: 10px; font-size: 0.8rem; text-align: center; }
+            #content { padding: 25px; padding-bottom: 130px; margin: 0; }
             .hide-mobile { display: none; }
         }
 
         h1, h2 { margin-top: 0; }
         .card { padding: 25px; margin-bottom: 25px; transition: 0.3s; }
-        .card:hover { border-color: rgba(155, 114, 203, 0.5); box-shadow: 0 0 25px var(--accent-glow); }
         
         .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; }
         .stat-box { text-align: center; padding: 30px 20px; }
@@ -444,20 +443,28 @@ HTML_TEMPLATE = """
         pre { color: #a1a1aa; font-family: monospace; font-size: 0.95rem; line-height: 1.5; }
         .highlight { color: #4285f4; font-weight: bold; }
 
+        /* Forms & Inputs */
+        label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; }
+        input[type="text"], input[type="password"], textarea, select { 
+            width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 6px; 
+            border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.6); color: white; 
+            outline: none; font-family: 'Space Grotesk'; font-size: 1rem; transition: 0.3s;
+        }
+        input:focus, textarea:focus, select:focus { border-color: #9b72cb; box-shadow: 0 0 15px var(--accent-glow); }
+        textarea { resize: vertical; min-height: 120px; }
+        
+        button { padding: 15px 25px; border-radius: 6px; border: none; background: var(--text-main); color: #000; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
+        button:hover { background: #fff; transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,255,255,0.2); }
+        
+        .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
+        .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 5px 20px rgba(239, 68, 68, 0.4); }
+
         #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(5,5,5,0.9); display: flex; justify-content: center; align-items: center; z-index: 1000; }
         .login-box { padding: 50px; text-align: center; width: 340px; border-top: 3px solid #4285f4; }
         
-        input { width: 85%; padding: 14px; margin: 25px 0; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.6); color: white; outline: none; font-family: 'Space Grotesk'; font-size: 1rem; text-align: center; transition: 0.3s;}
-        input:focus { border-color: #9b72cb; box-shadow: 0 0 15px var(--accent-glow); }
-        
-        button { width: 100%; padding: 15px; border-radius: 6px; border: none; background: var(--text-main); color: #000; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
-        button:hover { background: #fff; transform: translateY(-2px); box-shadow: 0 5px 20px rgba(255,255,255,0.2); }
-        
-        .logout-btn { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #fff; margin-top: 20px; }
-        .logout-btn:hover { background: rgba(255,255,255,0.1); color: white; transform: none; box-shadow: none; }
-        
         .hidden { display: none !important; }
         .visible-flex { display: flex !important; }
+        .visible-block { display: block !important; }
     </style>
 </head>
 <body>
@@ -470,46 +477,79 @@ HTML_TEMPLATE = """
             <h1 class="gemini-text" style="font-size: 2rem;">✨ YoAI System</h1>
             <p style="font-size: 0.85rem; letter-spacing: 2px; opacity: 0.5; text-transform: uppercase;">Authentication Required</p>
             <input type="password" id="pwd" placeholder="Enter Access Code">
-            <button onclick="login()">Enter Matrix</button>
+            <button onclick="login()" style="width: 100%;">Enter Matrix</button>
             <p id="err" style="color: #ef4444; display: none; margin-top: 20px; font-size: 0.9rem;">Access Denied.</p>
         </div>
     </div>
 
     <div id="dashboard-view" class="hidden" style="width: 100%; height: 100%;">
         <div id="nav" class="glass">
-            <h2 class="gemini-text" style="margin: 0;">✨ YoAI</h2>
-            <div class="hide-mobile" style="opacity: 0.5; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 2px;">Seinen Interface</div>
-            <div class="hide-mobile" style="margin-top: auto; font-size: 0.8rem; color: #a1a1aa;">Engine: <span id="model-display" class="highlight">Flash</span></div>
+            <div class="hide-mobile">
+                <h2 class="gemini-text" style="margin: 0;">✨ YoAI</h2>
+                <div style="opacity: 0.5; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 20px;">Command Center</div>
+            </div>
+            
+            <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
+            <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
+            
+            <div class="hide-mobile" style="margin-top: auto;">
+                <button class="btn-danger" style="width: 100%; padding: 10px; font-size: 0.8rem;" onclick="logout()">Logout</button>
+            </div>
         </div>
 
         <div id="content">
-            <h1 class="gemini-text">System Telemetry</h1>
-            <div class="stat-grid">
-                <div class="card glass stat-box">
-                    <div class="stat-label">Uptime</div>
-                    <div class="stat-value" id="uptime">-</div>
+            <div id="section-telemetry" class="visible-block">
+                <h1 class="gemini-text">System Telemetry</h1>
+                <div class="stat-grid">
+                    <div class="card glass stat-box">
+                        <div class="stat-label">Uptime</div>
+                        <div class="stat-value" id="uptime">-</div>
+                    </div>
+                    <div class="card glass stat-box">
+                        <div class="stat-label">Queries</div>
+                        <div class="stat-value" id="queries">-</div>
+                    </div>
+                    <div class="card glass stat-box">
+                        <div class="stat-label">Memory Nodes</div>
+                        <div class="stat-value" id="memory">-</div>
+                    </div>
                 </div>
-                <div class="card glass stat-box">
-                    <div class="stat-label">Queries</div>
-                    <div class="stat-value" id="queries">-</div>
-                </div>
-                <div class="card glass stat-box">
-                    <div class="stat-label">Memory Nodes</div>
-                    <div class="stat-value" id="memory">-</div>
-                </div>
-            </div>
-            
-            <div class="card glass" style="margin-top: 20px;">
-                <h2 style="font-size: 1.2rem; font-weight: 500; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px;">Live Terminal</h2>
-                <pre id="logs">
-[SYS] Initializing YoAI Seinen Protocol...
-[SYS] Gemini API interconnected.
-[SYS] <span class="highlight">Multi-Tier Fallback Matrix Active.</span>
-[SYS] Vision modules online.
+                
+                <div class="card glass" style="margin-top: 20px;">
+                    <h2 style="font-size: 1.2rem; font-weight: 500; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px;">Live Terminal</h2>
+                    <pre id="logs">
+[SYS] Initializing YoAI Command Center...
+[SYS] Master authentication accepted.
+[SYS] Engine: <span id="model-display" class="highlight">Loading...</span>
 [SYS] Standing by for incoming data streams...
-                </pre>
+                    </pre>
+                </div>
             </div>
-            <button class="logout-btn" onclick="logout()">Terminate Session</button>
+
+            <div id="section-admin" class="hidden">
+                <h1 class="gemini-text">Admin Control Panel</h1>
+                <div class="card glass">
+                    <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Core Matrix Directives</h2>
+                    
+                    <label>Global System Prompt</label>
+                    <textarea id="admin-prompt" placeholder="You are YoAI..."></textarea>
+                    
+                    <label>Primary AI Engine</label>
+                    <select id="admin-model">
+                        <option value="gemini-2.5-flash">Gemini 2.5 Flash (Fast & Efficient)</option>
+                        <option value="gemini-2.5-pro">Gemini 2.5 Pro (Highly Intelligent)</option>
+                    </select>
+                    
+                    <button onclick="saveConfig()">Deploy Config</button>
+                    <span id="save-status" style="margin-left: 15px; color: #10b981; display: none;">✅ Saved!</span>
+                </div>
+
+                <div class="card glass" style="border-color: rgba(239, 68, 68, 0.3);">
+                    <h2 style="font-size: 1.2rem; color: var(--danger); margin-bottom: 10px;">Danger Zone</h2>
+                    <p style="font-size: 0.9rem; opacity: 0.8; margin-bottom: 20px;">Executing a Hollow Purple will instantly wipe the entire SQLite conversation history across all Discord servers and DMs.</p>
+                    <button class="btn-danger" onclick="nukeMemory()">Execute Hollow Purple (Wipe Memory)</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -517,6 +557,18 @@ HTML_TEMPLATE = """
         function toggleUI(showDash) {
             document.getElementById('login-overlay').className = showDash ? 'glass hidden' : 'glass visible-flex';
             document.getElementById('dashboard-view').className = showDash ? 'visible-flex' : 'hidden';
+        }
+
+        function switchTab(tab) {
+            document.getElementById('tab-telemetry').classList.remove('active');
+            document.getElementById('tab-admin').classList.remove('active');
+            document.getElementById('section-telemetry').classList.replace('visible-block', 'hidden');
+            document.getElementById('section-admin').classList.replace('visible-block', 'hidden');
+
+            document.getElementById('tab-' + tab).classList.add('active');
+            document.getElementById('section-' + tab).classList.replace('hidden', 'visible-block');
+
+            if(tab === 'admin') fetchAdminConfig();
         }
 
         async function login() {
@@ -528,14 +580,48 @@ HTML_TEMPLATE = """
 
         async function fetchStats() {
             try {
+                if (document.getElementById('dashboard-view').classList.contains('hidden')) return;
                 const res = await fetch('/api/stats');
                 if (!res.ok) throw new Error('Unauthorized');
                 const data = await res.json();
                 document.getElementById('uptime').innerText = data.uptime;
                 document.getElementById('queries').innerText = data.total_queries;
                 document.getElementById('memory').innerText = data.active_memory_rows;
-                document.getElementById('model-display').innerText = data.current_model;
+                document.getElementById('model-display').innerText = data.current_model.replace("gemini-", "").toUpperCase();
             } catch (e) { toggleUI(false); }
+        }
+
+        async function fetchAdminConfig() {
+            const res = await fetch('/api/config');
+            if (res.ok) {
+                const data = await res.json();
+                document.getElementById('admin-prompt').value = data.system_prompt;
+                document.getElementById('admin-model').value = data.current_model;
+            }
+        }
+
+        async function saveConfig() {
+            const payload = {
+                system_prompt: document.getElementById('admin-prompt').value,
+                current_model: document.getElementById('admin-model').value
+            };
+            const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (res.ok) {
+                const status = document.getElementById('save-status');
+                status.style.display = 'inline';
+                setTimeout(() => status.style.display = 'none', 2000);
+                fetchStats(); // Update UI
+            }
+        }
+
+        async function nukeMemory() {
+            if(confirm("WARNING: This will permanently delete all chat history data. Proceed?")) {
+                const res = await fetch('/api/nuke', { method: 'POST' });
+                if(res.ok) {
+                    alert("Memory wiped successfully.");
+                    fetchStats();
+                }
+            }
         }
 
         async function logout() {
@@ -560,7 +646,8 @@ def index():
 @flask_app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    if data and data.get('password') == "11222333444455555":
+    # NEW PASSWORD: mr_yaen
+    if data and data.get('password') == "mr_yaen":
         session['logged_in'] = True
         return jsonify(success=True)
     return jsonify(success=False), 401
@@ -591,8 +678,35 @@ def api_stats():
         "uptime": uptime_str,
         "total_queries": TOTAL_QUERIES,
         "active_memory_rows": rows,
-        "current_model": current_model.replace("gemini-", "").upper()
+        "current_model": current_model
     })
+
+@flask_app.route('/api/config', methods=['GET', 'POST'])
+def api_config():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    
+    if request.method == 'GET':
+        sys_prompt = get_config('system_prompt', 'You are YoAI, a highly intelligent assistant.')
+        model = get_config('current_model', 'gemini-2.5-flash')
+        return jsonify({"system_prompt": sys_prompt, "current_model": model})
+    
+    if request.method == 'POST':
+        data = request.get_json()
+        if 'system_prompt' in data: set_config('system_prompt', data['system_prompt'])
+        if 'current_model' in data: set_config('current_model', data['current_model'])
+        return jsonify(success=True)
+
+@flask_app.route('/api/nuke', methods=['POST'])
+def api_nuke():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.execute("DELETE FROM message_history")
+        conn.commit()
+        conn.close()
+        
+    return jsonify(success=True)
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
