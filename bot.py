@@ -9,6 +9,7 @@ import random
 import time
 import asyncio
 import datetime
+import re
 
 # NEW GOOGLE SDK
 from google import genai
@@ -33,15 +34,14 @@ def init_db():
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
         c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS user_personality (user_id INTEGER PRIMARY KEY, preset TEXT)")
         c.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
         c.execute("""CREATE TABLE IF NOT EXISTS message_history (
             channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
             content TEXT, timestamp INTEGER
         )""")
-        # Default settings
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a highly intelligent assistant.')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('current_model', 'gemini-2.5-flash')")
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('global_personality', 'default')")
         conn.commit()
         conn.close()
 
@@ -101,22 +101,11 @@ class GeminiKeyManager:
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
 # -------------------- Helper Functions --------------------
-def get_user_personality(user_id: int) -> str:
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT preset FROM user_personality WHERE user_id=?", (user_id,))
-        result = c.fetchone()
-        conn.close()
-        return result[0] if result else "default"
+def get_global_personality() -> str:
+    return get_config('global_personality', 'default')
 
-def set_user_personality(user_id: int, preset: str):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO user_personality (user_id, preset) VALUES (?, ?)", (user_id, preset))
-        conn.commit()
-        conn.close()
+def set_global_personality(preset: str):
+    set_config('global_personality', preset)
 
 def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None: return True
@@ -167,6 +156,10 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
         conn.commit()
         conn.close()
 
+def clean_discord_name(name: str) -> str:
+    cleaned = "".join(c for c in name if c.isalnum() or c.isspace()).strip()
+    return cleaned if cleaned else "User"
+
 # -------------------- Discord Bot --------------------
 intents = discord.Intents.default()
 intents.message_content = True
@@ -193,16 +186,37 @@ async def status_loop():
     ]
     await bot.change_presence(activity=random.choice(statuses))
 
+# ⚙️ AUTO-OPTIMIZATION LOOP (Runs every 24 hours)
+@tasks.loop(hours=24)
+async def optimize_db():
+    print("[SYS] Initiating Auto-Optimization & Memory Garbage Collection...")
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Prune memories older than 7 days (604800 seconds)
+        seven_days_ago = int(time.time()) - 604800
+        c.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
+        # SQLite Vacuum defragments the DB to save disk space
+        conn.execute("VACUUM")
+        conn.commit()
+        conn.close()
+    print("[SYS] Optimization Complete. Database defragmented.")
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
     if not status_loop.is_running():
         status_loop.start()
+    if not optimize_db.is_running():
+        optimize_db.start()
 
 # -------------------- The AI Generator --------------------
-async def generate_ai_response(channel_id: int, user_message: str, author: discord.User, image_parts: list = None) -> str:
+async def generate_ai_response(channel: discord.abc.Messageable, user_message: str, author: discord.User, image_parts: list = None) -> str:
     global TOTAL_QUERIES
     TOTAL_QUERIES += 1
+
+    guild = getattr(channel, 'guild', None)
+    channel_id = channel.id
 
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -212,30 +226,35 @@ async def generate_ai_response(channel_id: int, user_message: str, author: disco
         history = c.fetchall()
         conn.close()
     
-    context_str = ""
+    context_str = "[SYSTEM: Below is the recent chat history for context]\n"
     for aid, cnt in history:
         if aid == 0:
-            context_str += f"[Summary]: {cnt}\n"
+            context_str += f"[System Summary]: {cnt}\n"
         else:
-            user_obj = bot.get_user(aid)
-            name = user_obj.display_name if user_obj else "Unknown User"
-            context_str += f"{name}: {cnt}\n"
+            user_obj = guild.get_member(aid) if guild else bot.get_user(aid)
+            raw_name = user_obj.display_name if user_obj else f"User_{aid}"
+            safe_name = clean_discord_name(raw_name)
+            context_str += f"{safe_name}: {cnt}\n"
             
-    context_str += f"{author.display_name}: {user_message}\nYoAI:"
+    current_safe_name = clean_discord_name(author.display_name)
+    
+    context_str += "[SYSTEM: End of history.]\n\n"
+    context_str += f"Reply directly to {current_safe_name}'s new message: {user_message}"
 
     payload = [context_str]
     if image_parts:
         payload.extend(image_parts)
 
     system = get_config('system_prompt', 'You are YoAI.')
+    
+    personality = get_global_personality()
+    if personality != "default":
+        system += f"\n\n[GLOBAL PERSONALITY OVERRIDE]: You must strictly follow this persona for ALL users: {personality}"
+
+    system += "\n\nCRITICAL DIRECTIVE: You are participating in a live Discord chat room. Respond DIRECTLY and NATURALLY to the user. DO NOT output a chat transcript. DO NOT write dialogue for other users. DO NOT prefix your response with 'YoAI:'."
+
     target_model = get_config('current_model', 'gemini-2.5-flash')
     
-    personality = get_user_personality(author.id)
-    if personality == "hacker":
-        system += " Respond like an elite hacker. Use terms like 'mainframe', 'jack in', and be slightly arrogant."
-    elif personality == "tsundere":
-        system += " Respond like a tsundere anime character. You pretend not to care about the user but actually do. Call them 'baka'."
-
     return key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
@@ -247,33 +266,61 @@ async def generate_ai_response(channel_id: int, user_message: str, author: disco
 ])
 async def model_cmd(interaction: discord.Interaction, model_name: app_commands.Choice[str]):
     set_config('current_model', model_name.value)
-    await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.\n*(If this model crashes, the system will automatically fall back to backups).*")
+    await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.")
 
-@bot.tree.command(name="core", description="Override the global system prompt")
+@bot.tree.command(name="personality", description="Set a GLOBAL custom personality prompt (or type 'default' to reset)")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def core(interaction: discord.Interaction, directive: str):
-    set_config('system_prompt', directive)
-    await interaction.response.send_message(f"✅ Core directive updated to:\n`{directive}`", ephemeral=True)
+async def personality(interaction: discord.Interaction, prompt: str):
+    if prompt.strip().lower() == "default":
+        set_global_personality("default")
+        await interaction.response.send_message("🌍 **Global Personality Reset:** YoAI has returned to default settings.")
+    else:
+        set_global_personality(prompt.strip())
+        await interaction.response.send_message(f"🌍 **Global Personality Updated:** YoAI will now act like this for everyone:\n`{prompt.strip()}`")
 
-@bot.tree.command(name="personality", description="Choose your interaction style")
+# 🧠 NEW: AI MEMORY TRACKING COMMAND
+@bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-@app_commands.choices(preset=[
-    app_commands.Choice(name="Default (Normal AI)", value="default"),
-    app_commands.Choice(name="Hacker", value="hacker"),
-    app_commands.Choice(name="Tsundere", value="tsundere"),
-])
-async def personality(interaction: discord.Interaction, preset: app_commands.Choice[str]):
-    set_user_personality(interaction.user.id, preset.value)
-    await interaction.response.send_message(f"🎭 Personality set to **{preset.name}**", ephemeral=True)
+async def memory_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    guild = interaction.guild
+    channel_id = interaction.channel_id
+    
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,))
+        history = c.fetchall()
+        conn.close()
+        
+    if not history:
+        return await interaction.followup.send("🧠 Memory Bank is currently empty for this sector.")
+        
+    context_str = ""
+    for aid, cnt in history:
+        if aid == 0:
+            context_str += f"[System Summary]: {cnt}\n"
+        else:
+            user_obj = guild.get_member(aid) if guild else bot.get_user(aid)
+            raw_name = user_obj.display_name if user_obj else f"User_{aid}"
+            safe_name = clean_discord_name(raw_name)
+            context_str += f"{safe_name}: {cnt}\n"
+            
+    analysis_prompt = f"Analyze the following chat memory bank. Give a concise, analytical overview of the current topics being discussed, the vibe of the channel, and a quick profile of the active users based on their dialogue:\n\n{context_str}"
+    
+    try:
+        target_model = get_config('current_model', 'gemini-2.5-flash')
+        sys_inst = "You are a cybernetic memory archivist. Keep your report structured, analytical, and brief."
+        analysis = key_manager.generate_with_fallback(target_model, [analysis_prompt], sys_inst)
+        await interaction.followup.send(f"🧠 **Memory Bank Analysis Complete:**\n\n{analysis}")
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Memory extraction failed: {e}")
 
 @bot.tree.command(name="hack", description="Prank a user with a fake hacking sequence")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def hack(interaction: discord.Interaction, user: discord.User):
     await interaction.response.defer()
-    fake_searches = [
-        "how to pretend i know python", "why does my code work but i don't know why",
-        "how to delete system32 safely", "is it illegal to download ram", "anime waifu tier list"
-    ]
+    fake_searches = ["how to pretend i know python", "why does my code work but i don't know why", "anime waifu tier list"]
     searches = random.sample(fake_searches, k=3)
     msg = await interaction.followup.send(f"💻 `Initiating brute-force attack on {user.display_name}'s mainframe...`")
     await asyncio.sleep(1.5)
@@ -303,7 +350,6 @@ async def info(interaction: discord.Interaction):
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
-    embed.add_field(name="Active API Keys", value=f"{key_manager.count()} Loaded", inline=True)
     embed.add_field(name="Total AI Queries", value=str(TOTAL_QUERIES), inline=True)
     embed.set_footer(text="Multi-Tier Fallback Matrix Active")
     await interaction.response.send_message(embed=embed)
@@ -351,7 +397,7 @@ async def on_message(message: discord.Message):
 
         try:
             async with message.channel.typing():
-                response = await generate_ai_response(message.channel.id, clean_content, message.author, image_parts)
+                response = await generate_ai_response(message.channel, clean_content, message.author, image_parts)
                 for i in range(0, len(response), 2000):
                     await message.reply(response[i:i+2000], mention_author=False)
         except Exception as e:
@@ -439,11 +485,11 @@ HTML_TEMPLATE = """
         .stat-box { text-align: center; padding: 30px 20px; }
         .stat-label { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 2px; opacity: 0.6; }
         .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; }
+        .stat-small { font-size: 1rem; opacity: 0.7; margin-top: 5px;}
         
         pre { color: #a1a1aa; font-family: monospace; font-size: 0.95rem; line-height: 1.5; }
         .highlight { color: #4285f4; font-weight: bold; }
 
-        /* Forms & Inputs */
         label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; }
         input[type="text"], input[type="password"], textarea, select { 
             width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 6px; 
@@ -513,6 +559,11 @@ HTML_TEMPLATE = """
                         <div class="stat-label">Memory Nodes</div>
                         <div class="stat-value" id="memory">-</div>
                     </div>
+                    <div class="card glass stat-box">
+                        <div class="stat-label">DB Weight</div>
+                        <div class="stat-value" id="db-size">-</div>
+                        <div class="stat-small">Kilobytes</div>
+                    </div>
                 </div>
                 
                 <div class="card glass" style="margin-top: 20px;">
@@ -520,6 +571,7 @@ HTML_TEMPLATE = """
                     <pre id="logs">
 [SYS] Initializing YoAI Command Center...
 [SYS] Master authentication accepted.
+[SYS] Auto-Optimization & Memory GC running.
 [SYS] Engine: <span id="model-display" class="highlight">Loading...</span>
 [SYS] Standing by for incoming data streams...
                     </pre>
@@ -587,6 +639,7 @@ HTML_TEMPLATE = """
                 document.getElementById('uptime').innerText = data.uptime;
                 document.getElementById('queries').innerText = data.total_queries;
                 document.getElementById('memory').innerText = data.active_memory_rows;
+                document.getElementById('db-size').innerText = data.db_size;
                 document.getElementById('model-display').innerText = data.current_model.replace("gemini-", "").toUpperCase();
             } catch (e) { toggleUI(false); }
         }
@@ -610,7 +663,7 @@ HTML_TEMPLATE = """
                 const status = document.getElementById('save-status');
                 status.style.display = 'inline';
                 setTimeout(() => status.style.display = 'none', 2000);
-                fetchStats(); // Update UI
+                fetchStats(); 
             }
         }
 
@@ -646,7 +699,6 @@ def index():
 @flask_app.route('/login', methods=['POST'])
 def login():
     data = request.get_json()
-    # NEW PASSWORD: mr_yaen
     if data and data.get('password') == "mr_yaen":
         session['logged_in'] = True
         return jsonify(success=True)
@@ -664,6 +716,12 @@ def api_stats():
     uptime_seconds = int(time.time() - START_TIME)
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     
+    # Calculate DB file size in KB
+    try:
+        db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
+    except:
+        db_size_kb = 0
+    
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         c = conn.cursor()
@@ -678,6 +736,7 @@ def api_stats():
         "uptime": uptime_str,
         "total_queries": TOTAL_QUERIES,
         "active_memory_rows": rows,
+        "db_size": db_size_kb,
         "current_model": current_model
     })
 
