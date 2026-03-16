@@ -324,9 +324,9 @@ async def toggle_cmd(interaction: discord.Interaction):
     set_config('engine_status', new_status)
     
     if new_status == 'offline':
-        await interaction.response.send_message("🛑 **Engine Offline:** YoAI has been put to sleep. It will completely ignore all messages until toggled back on.", ephemeral=False)
+        await interaction.response.send_message("🛑 **Engine Offline:** YoAI has been put to sleep. It will completely ignore all messages until toggled back on.")
     else:
-        await interaction.response.send_message("✅ **Engine Online:** YoAI is now awake and processing messages.", ephemeral=False)
+        await interaction.response.send_message("✅ **Engine Online:** YoAI is now awake and processing messages.")
     await status_loop()
 
 # 🔓 OPEN TO EVERYONE
@@ -336,9 +336,9 @@ async def time_cmd(interaction: discord.Interaction, seconds: int):
     seconds = max(0, seconds)
     set_config('response_delay', str(seconds))
     if seconds == 0:
-        await interaction.response.send_message("⏱️ **Response Time:** Normal (Instant). YoAI will reply immediately.", ephemeral=True)
+        await interaction.response.send_message("⏱️ **Response Time:** Normal (Instant). YoAI will reply immediately.")
     else:
-        await interaction.response.send_message(f"⏱️ **Response Time:** Delayed by {seconds} seconds.\nYoAI will loop the 'typing...' animation for {seconds}s before dropping the message.", ephemeral=True)
+        await interaction.response.send_message(f"⏱️ **Response Time:** Delayed by {seconds} seconds.\nYoAI will loop the 'typing...' animation for {seconds}s before dropping the message.")
 
 # 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="model", description="Change the primary Gemini AI model.")
@@ -451,7 +451,7 @@ async def info(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_channels=True)
 async def setchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, True)
-    await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}", ephemeral=True)
+    await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}")
 
 # 🔒 LOCKED TO MANAGE CHANNELS
 @bot.tree.command(name="unsetchannel", description="Stop YoAI from automatically replying in this channel.")
@@ -459,7 +459,7 @@ async def setchannel(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_channels=True)
 async def unsetchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, False)
-    await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
+    await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
 # -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
 @bot.event
