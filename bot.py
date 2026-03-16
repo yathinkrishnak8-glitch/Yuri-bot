@@ -43,9 +43,9 @@ def init_db():
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a highly intelligent assistant.')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('current_model', 'gemini-2.5-flash')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('global_personality', 'default')")
-        # Customization Configs
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_type', 'watching')")
         c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_text', 'over the Matrix')")
+        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('response_delay', '0')")
         conn.commit()
         conn.close()
 
@@ -225,7 +225,6 @@ class YoAIBot(commands.Bot):
 
 bot = YoAIBot()
 
-# Dynamic Status Loop (Checks DB every 60 seconds)
 @tasks.loop(seconds=60)
 async def status_loop():
     s_type = get_config('status_type', 'watching')
@@ -306,6 +305,19 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     return key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
+
+# 🔓 OPEN TO EVERYONE
+@bot.tree.command(name="time", description="Set a global artificial delay for YoAI's responses (in seconds).")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def time_cmd(interaction: discord.Interaction, seconds: int):
+    seconds = max(0, seconds)
+    set_config('response_delay', str(seconds))
+    if seconds == 0:
+        await interaction.response.send_message("⏱️ **Response Time:** Normal (Instant). YoAI will reply immediately.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⏱️ **Response Time:** Delayed by {seconds} seconds.\nYoAI will loop the 'typing...' animation for {seconds}s before dropping the message.", ephemeral=True)
+
+# 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="model", description="Change the primary Gemini AI model.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 @app_commands.choices(model_name=[
@@ -316,7 +328,8 @@ async def model_cmd(interaction: discord.Interaction, model_name: app_commands.C
     set_config('current_model', model_name.value)
     await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.")
 
-@bot.tree.command(name="personality", description="Set a GLOBAL custom personality prompt (or type 'default' to reset)")
+# 🔓 OPEN TO EVERYONE
+@bot.tree.command(name="personality", description="Set a GLOBAL custom personality prompt")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def personality(interaction: discord.Interaction, prompt: str):
     if prompt.strip().lower() == "default":
@@ -326,6 +339,19 @@ async def personality(interaction: discord.Interaction, prompt: str):
         set_global_personality(prompt.strip())
         await interaction.response.send_message(f"🌍 **Global Personality Updated:** YoAI will now act like this for everyone:\n`{prompt.strip()}`")
 
+# 🔓 OPEN TO EVERYONE
+@bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def clear_cmd(interaction: discord.Interaction):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
+        conn.commit()
+        conn.close()
+    await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
+
+# 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def memory_cmd(interaction: discord.Interaction):
@@ -363,17 +389,20 @@ async def memory_cmd(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"⚠️ Memory extraction failed: {e}")
 
-@bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
+# 🔓 OPEN TO EVERYONE
+@bot.tree.command(name="hack", description="Prank a user with a fake hacking sequence")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def clear_cmd(interaction: discord.Interaction):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
-        conn.commit()
-        conn.close()
-    await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
+async def hack(interaction: discord.Interaction, user: discord.User):
+    await interaction.response.defer()
+    fake_searches = ["how to pretend i know python", "why does my code work but i don't know why", "anime waifu tier list"]
+    searches = random.sample(fake_searches, k=3)
+    msg = await interaction.followup.send(f"💻 `Initiating brute-force attack on {user.display_name}'s mainframe...`")
+    await asyncio.sleep(1.5)
+    await msg.edit(content=f"🔓 `Firewall bypassed. Extracting search history...`")
+    await asyncio.sleep(1.5)
+    await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
 
+# 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="info", description="Bot statistics")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def info(interaction: discord.Interaction):
@@ -384,7 +413,6 @@ async def info(interaction: discord.Interaction):
     stats = key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    # Updated color to match the Satan Black / Crimson theme
     embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a)
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
@@ -394,16 +422,16 @@ async def info(interaction: discord.Interaction):
     embed.set_footer(text="Smart Load Balancer Active")
     await interaction.response.send_message(embed=embed)
 
+# 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.default_permissions(manage_channels=True)
 async def setchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, True)
     await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}", ephemeral=True)
 
+# 🔓 OPEN TO EVERYONE
 @bot.tree.command(name="unsetchannel", description="Stop YoAI from automatically replying in this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
-@app_commands.default_permissions(manage_channels=True)
 async def unsetchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
@@ -414,7 +442,7 @@ async def on_message(message: discord.Message):
     if message.author == bot.user: return
 
     is_dm = message.guild is None
-    is_mentioned = bot.user in message.mentions
+    is_mentioned = bot.user in message.mentions or f'<@{bot.user.id}>' in message.content or f'<@!{bot.user.id}>' in message.content
     is_allowed = True if is_dm else is_channel_allowed(message.guild.id, message.channel.id)
 
     if is_dm or is_mentioned or is_allowed:
@@ -436,7 +464,12 @@ async def on_message(message: discord.Message):
                     image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
 
         try:
+            delay = float(get_config('response_delay', '0'))
+            
             async with message.channel.typing():
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    
                 response = await generate_ai_response(message.channel, clean_content, message.author, image_parts)
                 for i in range(0, len(response), 2000):
                     await message.reply(response[i:i+2000], mention_author=False)
@@ -477,7 +510,7 @@ HTML_TEMPLATE = """
             --glass: rgba(10, 10, 10, 0.5);
             --glass-border: rgba(255, 255, 255, 0.05);
             --text-main: #f3f4f6;
-            --accent: #ff2a2a; /* Crimson Red / Satan Black accent */
+            --accent: #ff2a2a;
             --accent-glow: rgba(255, 42, 42, 0.4);
             --danger: #ef4444;
             --success: #10b981;
@@ -487,7 +520,6 @@ HTML_TEMPLATE = """
             margin: 0; font-family: 'Space Grotesk', sans-serif; color: var(--text-main); 
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
-        /* Dark Abstract / Carbon Smoke Video Background */
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
             object-fit: cover; z-index: -1; filter: brightness(0.3) contrast(1.3) grayscale(0.2);
@@ -496,7 +528,7 @@ HTML_TEMPLATE = """
             background: var(--glass);
             backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
             border: 1px solid var(--glass-border);
-            border-radius: 8px; /* Sharp corners for aerodynamic feel */
+            border-radius: 8px;
             box-shadow: 0 15px 50px rgba(0,0,0,0.9);
         }
         
@@ -636,8 +668,7 @@ HTML_TEMPLATE = """
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Execute a high-performance ping across the load-balanced API array. Verifies the RPM and health of all connected Google nodes.</p>
                     <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
                     
-                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);">
-                    </div>
+                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
                 </div>
             </div>
 
@@ -839,8 +870,7 @@ HTML_TEMPLATE = """
 """
 
 @flask_app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
+def index(): return render_template_string(HTML_TEMPLATE)
 
 @flask_app.route('/login', methods=['POST'])
 def login():
@@ -875,10 +905,7 @@ def api_stats():
         current_model = res[0] if res else "gemini-2.5-flash"
         conn.close()
         
-    return jsonify({
-        "uptime": uptime_str, "total_queries": TOTAL_QUERIES,
-        "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model
-    })
+    return jsonify({"uptime": uptime_str, "total_queries": TOTAL_QUERIES, "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model})
 
 @flask_app.route('/api/diagnostics', methods=['POST'])
 def api_diagnostics():
@@ -899,10 +926,8 @@ def api_config():
     
     if request.method == 'POST':
         data = request.get_json()
-        if 'system_prompt' in data: set_config('system_prompt', data['system_prompt'])
-        if 'current_model' in data: set_config('current_model', data['current_model'])
-        if 'status_type' in data: set_config('status_type', data['status_type'])
-        if 'status_text' in data: set_config('status_text', data['status_text'])
+        for k in ['system_prompt', 'current_model', 'status_type', 'status_text']:
+            if k in data: set_config(k, data[k])
         return jsonify(success=True)
 
 @flask_app.route('/api/nuke', methods=['POST'])
