@@ -1,6 +1,6 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from flask import Flask, request, session, jsonify, render_template_string
 import threading
 import sqlite3
@@ -72,8 +72,7 @@ class GeminiKeyManager:
     def count(self) -> int:
         return len(self.keys)
     
-    def generate_with_fallback(self, target_model: str, contents: str, system_instruction: str = None) -> str:
-        # THE FALLBACK MATRIX: 1.5 series removed. Exclusively 2.5 series now.
+    def generate_with_fallback(self, target_model: str, contents: list, system_instruction: str = None) -> str:
         fallback_models = [target_model, 'gemini-2.5-flash', 'gemini-2.5-pro']
         models_to_try = list(dict.fromkeys(fallback_models)) 
         
@@ -154,10 +153,10 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
                          WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
             oldest = c.fetchall()
             if oldest:
-                texts = [f"User {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
+                texts = [f"User ID {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
                 if texts:
                     try:
-                        summary_text = key_manager.generate_with_fallback('gemini-2.5-flash', f"Summarize concisely:\n{chr(10).join(texts)}")
+                        summary_text = key_manager.generate_with_fallback('gemini-2.5-flash', [f"Summarize concisely:\n{chr(10).join(texts)}"])
                     except:
                         summary_text = "[Summary unavailable]"
                     
@@ -168,7 +167,40 @@ def add_message_to_history(channel_id: int, message_id: int, author_id: int, con
         conn.commit()
         conn.close()
 
-async def generate_ai_response(channel_id: int, user_message: str, author_id: int) -> str:
+# -------------------- Discord Bot --------------------
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.messages = True
+intents.members = True # Ensure we can fetch Display Names
+
+class YoAIBot(commands.Bot):
+    def __init__(self):
+        super().__init__(command_prefix="!", intents=intents)
+
+    async def setup_hook(self):
+        await self.tree.sync()
+        print(f"Synced commands for {self.user}")
+
+bot = YoAIBot()
+
+@tasks.loop(minutes=10)
+async def status_loop():
+    statuses = [
+        discord.Activity(type=discord.ActivityType.watching, name="over the Matrix"),
+        discord.Activity(type=discord.ActivityType.listening, name="the Rain"),
+        discord.Activity(type=discord.ActivityType.playing, name="with Gemini 2.5 Flash")
+    ]
+    await bot.change_presence(activity=random.choice(statuses))
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    if not status_loop.is_running():
+        status_loop.start()
+
+# -------------------- The AI Generator --------------------
+async def generate_ai_response(channel_id: int, user_message: str, author: discord.User, image_parts: list = None) -> str:
     global TOTAL_QUERIES
     TOTAL_QUERIES += 1
 
@@ -180,36 +212,33 @@ async def generate_ai_response(channel_id: int, user_message: str, author_id: in
         history = c.fetchall()
         conn.close()
     
-    context = "".join([f"[Summary]: {cnt}\n" if aid == 0 else f"User {aid}: {cnt}\n" for aid, cnt in history])
-    context += f"User {author_id}: {user_message}\nYoAI:"
+    context_str = ""
+    for aid, cnt in history:
+        if aid == 0:
+            context_str += f"[Summary]: {cnt}\n"
+        else:
+            # FIXED: Grabs the actual Display Name of the user instead of their raw ID number!
+            user_obj = bot.get_user(aid)
+            name = user_obj.display_name if user_obj else "Unknown User"
+            context_str += f"{name}: {cnt}\n"
+            
+    context_str += f"{author.display_name}: {user_message}\nYoAI:"
+
+    # Compile the final payload (Text + Images if any)
+    payload = [context_str]
+    if image_parts:
+        payload.extend(image_parts)
 
     system = get_config('system_prompt', 'You are YoAI.')
     target_model = get_config('current_model', 'gemini-2.5-flash')
     
-    personality = get_user_personality(author_id)
+    personality = get_user_personality(author.id)
     if personality == "hacker":
         system += " Respond like an elite hacker. Use terms like 'mainframe', 'jack in', and be slightly arrogant."
     elif personality == "tsundere":
         system += " Respond like a tsundere anime character. You pretend not to care about the user but actually do. Call them 'baka'."
 
-    # Removed the try/except block here so the error bubbles up to the Discord event listener for DM routing
-    return key_manager.generate_with_fallback(target_model, context, system)
-
-# -------------------- Discord Bot --------------------
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.messages = True
-
-class YoAIBot(commands.Bot):
-    def __init__(self):
-        super().__init__(command_prefix="!", intents=intents)
-
-    async def setup_hook(self):
-        await self.tree.sync()
-        print(f"Synced commands for {self.user}")
-
-bot = YoAIBot()
+    return key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
 @bot.tree.command(name="model", description="Change the primary Gemini AI model.")
@@ -254,6 +283,17 @@ async def hack(interaction: discord.Interaction, user: discord.User):
     await asyncio.sleep(1.5)
     await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
 
+@bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def clear_cmd(interaction: discord.Interaction):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
+        conn.commit()
+        conn.close()
+    await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
+
 @bot.tree.command(name="info", description="Bot statistics")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def info(interaction: discord.Interaction):
@@ -284,7 +324,7 @@ async def unsetchannel(interaction: discord.Interaction):
     toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}", ephemeral=True)
 
-# -------------------- DM & Server Message Routing w/ Admin Error Handling --------------------
+# -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user: return
@@ -295,22 +335,31 @@ async def on_message(message: discord.Message):
 
     if is_dm or is_mentioned or is_allowed:
         clean_content = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
-        if not clean_content: clean_content = "Hello! You pinged me?"
+        if not clean_content and not message.attachments: 
+            clean_content = "Hello! You pinged me?"
 
         add_message_to_history(
             channel_id=message.channel.id, message_id=message.id,
-            author_id=message.author.id, content=clean_content,
+            author_id=message.author.id, content=clean_content or "[Sent an Image]",
             timestamp=int(message.created_at.timestamp())
         )
 
+        # VISION: Process Images if the user attached any!
+        image_parts = []
+        if message.attachments:
+            for att in message.attachments:
+                if att.content_type and att.content_type.startswith('image/'):
+                    img_bytes = await att.read()
+                    image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
+
         try:
             async with message.channel.typing():
-                response = await generate_ai_response(message.channel.id, clean_content, message.author.id)
+                response = await generate_ai_response(message.channel.id, clean_content, message.author, image_parts)
                 for i in range(0, len(response), 2000):
                     await message.reply(response[i:i+2000], mention_author=False)
         except Exception as e:
             # PUBLIC ERROR MESSAGE
-            error_public = "There is an error\nThe issue is send to master admin yaen the issue will be fixed soon wait until yaen beat it up"
+            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
             await message.reply(error_public, mention_author=False)
             
             # DM MASTER ADMIN (Fetches the bot owner dynamically)
@@ -456,6 +505,7 @@ HTML_TEMPLATE = """
 [SYS] Initializing YoAI Seinen Protocol...
 [SYS] Gemini API interconnected.
 [SYS] <span class="highlight">Multi-Tier Fallback Matrix Active.</span>
+[SYS] Vision modules online.
 [SYS] Standing by for incoming data streams...
                 </pre>
             </div>
