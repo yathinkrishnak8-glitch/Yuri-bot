@@ -124,6 +124,7 @@ class GeminiKeyManager:
             with self.lock:
                 now = time.time()
                 available_keys = [k for k in self.all_keys if k not in self.dead_keys and self.key_cooldowns[k] <= now]
+            
             if not available_keys: continue 
             
             random.shuffle(available_keys)
@@ -511,7 +512,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Satan Black Liquid Glass UI) --------------------
+# -------------------- Flask Web Dashboard (Live CSS Terminal UI) --------------------
 flask_app = Flask(__name__)
 flask_app.secret_key = FLASK_SECRET
 
@@ -540,7 +541,7 @@ HTML_TEMPLATE = """
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
         
-        /* THE PURE CSS SATAN BLACK LIQUID ENGINE */
+        /* PURE CSS SATAN BLACK LIQUID ENGINE */
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -2;
             background: linear-gradient(120deg, #000000, #0a0000, #050000, #140000);
@@ -554,30 +555,12 @@ HTML_TEMPLATE = """
         .orb-1 { width: 50vw; height: 50vw; background: rgba(255, 42, 42, 0.08); top: -10%; left: -10%; }
         .orb-2 { width: 60vw; height: 60vw; background: rgba(150, 0, 0, 0.06); bottom: -20%; right: -10%; animation-delay: -5s; }
         
-        @keyframes liquidFlow {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-        @keyframes float {
-            0% { transform: translate(0, 0) scale(1); }
-            100% { transform: translate(5vw, 10vh) scale(1.2); }
-        }
+        @keyframes liquidFlow { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
+        @keyframes float { 0% { transform: translate(0, 0) scale(1); } 100% { transform: translate(5vw, 10vh) scale(1.2); } }
 
-        .glass {
-            background: var(--glass);
-            backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px);
-            border: 1px solid var(--glass-border);
-            border-radius: 8px;
-            box-shadow: 0 15px 50px rgba(0,0,0,0.9);
-        }
+        .glass { background: var(--glass); backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px); border: 1px solid var(--glass-border); border-radius: 8px; box-shadow: 0 15px 50px rgba(0,0,0,0.9); }
+        .accent-text { color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 15px var(--accent-glow); }
         
-        .accent-text {
-            color: var(--accent);
-            font-weight: 700; text-transform: uppercase; letter-spacing: 2px;
-            text-shadow: 0 0 15px var(--accent-glow);
-        }
-
         #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-left: 4px solid var(--accent); }
         .nav-tab { padding: 12px 15px; border-radius: 4px; cursor: pointer; transition: 0.3s; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
         .nav-tab:hover { background: rgba(255,255,255,0.03); }
@@ -602,8 +585,11 @@ HTML_TEMPLATE = """
         .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; text-shadow: 0 0 20px rgba(255,255,255,0.1); }
         .stat-small { font-size: 1rem; opacity: 0.5; margin-top: 5px;}
         
-        pre { color: #a1a1aa; font-family: monospace; font-size: 0.95rem; line-height: 1.5; }
-        .highlight { color: var(--accent); font-weight: bold; }
+        /* 🔴 THE LIVE TERMINAL STYLES 🔴 */
+        #logs-container { max-height: 250px; overflow-y: auto; padding: 15px; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,42,42,0.2); border-radius: 4px; box-shadow: inset 0 0 15px rgba(0,0,0,1); scroll-behavior: smooth; }
+        pre { color: #ff5555; font-family: 'Courier New', Courier, monospace; font-size: 0.95rem; line-height: 1.6; text-shadow: 0 0 8px rgba(255,42,42,0.4); margin: 0; white-space: pre-wrap; word-wrap: break-word; }
+        .cursor { display: inline-block; width: 10px; height: 1.2em; background-color: var(--accent); vertical-align: middle; animation: blink 1s step-end infinite; box-shadow: 0 0 10px var(--accent); }
+        @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
         label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.7; }
         input[type="text"], input[type="password"], textarea, select { 
@@ -614,21 +600,17 @@ HTML_TEMPLATE = """
         input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); }
         textarea { resize: vertical; min-height: 120px; }
         
-        button { padding: 15px 25px; border-radius: 4px; border: 1px solid rgba(255,42,42,0.3); background: rgba(255,42,42,0.1); color: #fff; font-weight: 700; font-size: 1rem; font-family: 'Space Grotesk'; cursor: pointer; transition: 0.3s; text-transform: uppercase; letter-spacing: 1.5px; }
+        button { padding: 15px 25px; border-radius: 4px; border: 1px solid rgba(255,42,42,0.3); background: rgba(255,42,42,0.1); color: #fff; font-weight: 700; text-transform: uppercase; cursor: pointer; transition: 0.3s; }
         button:hover { background: var(--accent); box-shadow: 0 0 25px var(--accent-glow); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; border-color: #555; box-shadow: none; color: #555; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; border-color: #555; }
         
         .btn-danger { background: rgba(239, 68, 68, 0.05); border: 1px solid var(--danger); color: var(--danger); }
         .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 25px rgba(239, 68, 68, 0.5); }
-
-        .key-row { display: flex; justify-content: space-between; align-items: center; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.02); }
-        .key-row:last-child { border-bottom: none; }
-        .key-name { font-family: monospace; font-size: 1.1rem; letter-spacing: 1px; color: #cbd5e1; }
-        .badge { padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; }
+        .key-row { display: flex; justify-content: space-between; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.02); }
+        .badge { padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; }
 
         #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; justify-content: center; align-items: center; z-index: 1000; }
         .login-box { padding: 50px; text-align: center; width: 340px; border-top: 4px solid var(--accent); }
-        
         .hidden { display: none !important; }
         .visible-flex { display: flex !important; }
         .visible-block { display: block !important; }
@@ -691,14 +673,9 @@ HTML_TEMPLATE = """
                 
                 <div class="card glass" style="margin-top: 20px;">
                     <h2 style="font-size: 1.2rem; font-weight: 500; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px;">Live Terminal</h2>
-                    <pre id="logs">
-[SYS] Apex Engine Initialized.
-[SYS] Ignition sequence accepted.
-[SYS] <span class="highlight">Safety Overrides Online (Unshackled).</span>
-[SYS] Aerodynamics & Memory GC optimal.
-[SYS] Engine Block: <span id="model-display" class="highlight">Loading...</span>
-[SYS] Awaiting input signals...
-                    </pre>
+                    <div id="logs-container">
+                        <pre><span id="log-content"></span><span class="cursor"></span></pre>
+                    </div>
                 </div>
             </div>
 
@@ -707,7 +684,6 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Execute a high-performance ping across the load-balanced API array. Verifies the RPM and health of all connected Google nodes.</p>
                     <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
-                    
                     <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
                 </div>
             </div>
@@ -717,7 +693,6 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Discord Presence (Status)</h2>
                     <p style="font-size: 0.85rem; opacity: 0.6; margin-bottom: 20px;">Changes what the bot is actively "Doing" on Discord. Updates sync within 60 seconds.</p>
-                    
                     <label>Activity Type</label>
                     <select id="cust-status-type">
                         <option value="playing">Playing</option>
@@ -726,10 +701,8 @@ HTML_TEMPLATE = """
                         <option value="competing">Competing in</option>
                         <option value="streaming">Streaming</option>
                     </select>
-                    
                     <label>Activity Description</label>
                     <input type="text" id="cust-status-text" placeholder="e.g. over the Matrix, the Rain...">
-                    
                     <button onclick="saveCustomization()">Push Update to Discord</button>
                     <span id="save-cust-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Synced!</span>
                 </div>
@@ -739,23 +712,19 @@ HTML_TEMPLATE = """
                 <h1 class="accent-text">Admin Control Panel</h1>
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Core Matrix Directives</h2>
-                    
                     <label>Global System Prompt</label>
                     <textarea id="admin-prompt" placeholder="You are YoAI..."></textarea>
-                    
                     <label>Primary AI Engine Block</label>
                     <select id="admin-model">
                         <option value="gemini-2.5-flash-lite">Gemini 2.5 Flash Lite (Token Saver)</option>
                         <option value="gemini-2.5-flash">Gemini 2.5 Flash (Balanced)</option>
                         <option value="gemini-2.5-pro">Gemini 2.5 Pro (Highly Intelligent)</option>
-                        <option value="gemini-2.0-flash">Gemini 2.0 Flash</option>
-                        <option value="gemini-2.0-pro-exp">Gemini 2.0 Pro Experimental</option>
+                        <option value="gemini-2.0-flash">Gemini 2.0 Flash (Legacy Fast)</option>
+                        <option value="gemini-2.0-pro-exp">Gemini 2.0 Pro Experimental (Reasoning)</option>
                     </select>
-                    
                     <button onclick="saveConfig()">Deploy Config</button>
                     <span id="save-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Saved!</span>
                 </div>
-
                 <div class="card glass" style="border-color: rgba(239, 68, 68, 0.3);">
                     <h2 style="font-size: 1.2rem; color: var(--danger); margin-bottom: 10px;">Danger Zone</h2>
                     <p style="font-size: 0.9rem; opacity: 0.7; margin-bottom: 20px;">Executing a hard reset will permanently incinerate the entire SQLite conversation history across all environments.</p>
@@ -766,11 +735,49 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
+        // 🔴 LIVE TERMINAL JAVASCRIPT LOGIC 🔴
+        const bootSequence = [
+            "[SYS] Apex Engine Initializing...",
+            "[SYS] Matrix Connection Established.",
+            "[SYS] Core Safety Overrides: UNSHACKLED.",
+            "[SYS] SQLite Memory Bank: MOUNTED.",
+            "[SYS] Loading V12 Neural Weights...",
+            "[SYS] Standing by for incoming signals."
+        ];
+        
+        let bootLine = 0;
+        let lastQueryCount = 0;
+
+        function typeTerminalLine(text, callback) {
+            const el = document.getElementById('log-content');
+            let charIndex = 0;
+            const typeInterval = setInterval(() => {
+                el.innerHTML += text.charAt(charIndex);
+                charIndex++;
+                if (charIndex >= text.length) {
+                    clearInterval(typeInterval);
+                    el.innerHTML += "<br>";
+                    document.getElementById('logs-container').scrollTop = document.getElementById('logs-container').scrollHeight;
+                    if(callback) setTimeout(callback, 300);
+                }
+            }, 30); // Typing speed
+        }
+
+        function runBootSequence() {
+            if (bootLine < bootSequence.length) {
+                typeTerminalLine(bootSequence[bootLine], runBootSequence);
+                bootLine++;
+            }
+        }
+
+        // ------------------------------------
+
         function toggleUI(showDash) {
             document.getElementById('login-overlay').className = showDash ? 'glass hidden' : 'glass visible-flex';
             document.getElementById('dashboard-view').className = showDash ? 'visible-flex' : 'hidden';
             if(showDash) {
                 document.getElementById('dashboard-view').style.display = 'flex';
+                setTimeout(runBootSequence, 500); // Start typing when logged in
             } else {
                 document.getElementById('dashboard-view').style.display = 'none';
             }
@@ -781,7 +788,6 @@ HTML_TEMPLATE = """
                 document.getElementById('tab-' + t).classList.remove('active');
                 document.getElementById('section-' + t).classList.replace('visible-block', 'hidden');
             });
-
             document.getElementById('tab-' + tab).classList.add('active');
             document.getElementById('section-' + tab).classList.replace('hidden', 'visible-block');
 
@@ -810,11 +816,21 @@ HTML_TEMPLATE = """
                 const res = await fetch('/api/stats');
                 if (!res.ok) throw new Error('Unauthorized');
                 const data = await res.json();
+                
                 document.getElementById('uptime').innerText = data.uptime;
                 document.getElementById('queries').innerText = data.total_queries;
                 document.getElementById('memory').innerText = data.active_memory_rows;
                 document.getElementById('db-size').innerText = data.db_size;
-                document.getElementById('model-display').innerText = data.current_model.replace("gemini-", "").toUpperCase();
+                
+                // 🔴 LIVE TERMINAL UPDATE LOGIC 🔴
+                if (lastQueryCount !== 0 && data.total_queries > lastQueryCount) {
+                    const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+                    const diff = data.total_queries - lastQueryCount;
+                    document.getElementById('log-content').innerHTML += `[${time}] SIGNAL RECEIVED. Processing +${diff} data packets.<br>`;
+                    document.getElementById('logs-container').scrollTop = document.getElementById('logs-container').scrollHeight;
+                }
+                lastQueryCount = data.total_queries;
+
             } catch (e) { console.log("Stats fetch error."); }
         }
 
@@ -924,6 +940,8 @@ HTML_TEMPLATE = """
             await fetch('/logout', { method: 'POST' });
             toggleUI(false); 
             document.getElementById('pwd').value = '';
+            document.getElementById('log-content').innerHTML = ''; // Reset terminal on logout
+            bootLine = 0;
         }
 
         window.onload = async () => {
