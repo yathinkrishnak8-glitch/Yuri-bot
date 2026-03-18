@@ -72,7 +72,29 @@ def set_config(key: str, value: str):
 # -------------------- Smart Cluster Load Balancer --------------------
 class GeminiKeyManager:
     def __init__(self, keys: list):
-        self.all_keys = [k.strip() for k in keys if k.strip()]
+        self.key_objects = []
+        self.all_keys = []
+        
+        for i, k in enumerate(keys):
+            k = k.strip()
+            if not k: continue
+            
+            # Smart Parsing for the new Key Tracker Tab
+            name = f"Node {i+1}"
+            actual_key = k
+            
+            if ":" in k and not k.startswith("AIza"):
+                parts = k.split(":", 1)
+                name = parts[0].strip()
+                actual_key = parts[1].strip()
+            
+            self.key_objects.append({
+                'index': i + 1,
+                'name': name,
+                'key': actual_key
+            })
+            self.all_keys.append(actual_key)
+            
         self.key_cooldowns = {k: 0.0 for k in self.all_keys}
         self.dead_keys = set()
         self.lock = threading.Lock()
@@ -95,24 +117,48 @@ class GeminiKeyManager:
             
     def run_diagnostics(self) -> list:
         results = []
-        for key in self.all_keys:
+        for obj in self.key_objects:
+            key = obj['key']
             masked_key = f"{key[:8]}•••••••••••••••••••••••••••••{key[-4:]}"
+            
             try:
                 client = genai.Client(api_key=key)
                 client.models.generate_content(model='gemini-2.5-flash-lite', contents="ping")
                 with self.lock:
                     if key in self.dead_keys: self.dead_keys.remove(key)
                     self.key_cooldowns[key] = 0.0
-                results.append({"key": masked_key, "status": "ONLINE", "detail": "Healthy & Ready", "color": "#10b981"})
+                
+                results.append({
+                    "index": obj['index'],
+                    "name": obj['name'],
+                    "masked_key": masked_key,
+                    "status": "ONLINE",
+                    "detail": "Healthy & Ready",
+                    "color": "#10b981"
+                })
             except Exception as e:
                 error_msg = str(e).lower()
                 with self.lock:
                     if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
                         self.key_cooldowns[key] = time.time() + 60.0
-                        results.append({"key": masked_key, "status": "COOLDOWN", "detail": "Rate Limited / Quota Reached", "color": "#f59e0b"})
+                        results.append({
+                            "index": obj['index'],
+                            "name": obj['name'],
+                            "masked_key": masked_key,
+                            "status": "COOLDOWN",
+                            "detail": "Rate Limited / Quota Reached",
+                            "color": "#f59e0b"
+                        })
                     else:
                         self.dead_keys.add(key)
-                        results.append({"key": masked_key, "status": "DEAD", "detail": "Invalid / Forbidden / Deleted", "color": "#ef4444"})
+                        results.append({
+                            "index": obj['index'],
+                            "name": obj['name'],
+                            "masked_key": masked_key,
+                            "status": "DEAD",
+                            "detail": "Invalid / Forbidden / Deleted",
+                            "color": "#ef4444"
+                        })
         return results
 
     def generate_with_fallback(self, target_model: str, contents: list, system_instruction: str = None) -> str:
@@ -640,6 +686,7 @@ HTML_TEMPLATE = """
             
             <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
             <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
+            <div class="nav-tab" id="tab-tracker" onclick="switchTab('tracker')">Key Tracker</div>
             <div class="nav-tab" id="tab-customization" onclick="switchTab('customization')">Customization</div>
             <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
             
@@ -680,11 +727,20 @@ HTML_TEMPLATE = """
             </div>
 
             <div id="section-diagnostics" class="hidden">
-                <h1 class="accent-text">Cluster Diagnostics</h1>
+                <h1 class="accent-text">Cluster Health</h1>
                 <div class="card glass">
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Execute a high-performance ping across the load-balanced API array. Verifies the RPM and health of all connected Google nodes.</p>
                     <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
                     <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
+                </div>
+            </div>
+
+            <div id="section-tracker" class="hidden">
+                <h1 class="accent-text">Key Tracker</h1>
+                <div class="card glass">
+                    <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Track the exact status of your custom-named API keys. Format in Render: <code>Name:Key, Backup:Key2</code></p>
+                    <button id="tracker-btn" onclick="runDiagnostics()">Scan Named Keys</button>
+                    <div id="tracker-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
                 </div>
             </div>
 
@@ -784,7 +840,7 @@ HTML_TEMPLATE = """
         }
 
         function switchTab(tab) {
-            ['telemetry', 'diagnostics', 'customization', 'admin'].forEach(t => {
+            ['telemetry', 'diagnostics', 'tracker', 'customization', 'admin'].forEach(t => {
                 document.getElementById('tab-' + t).classList.remove('active');
                 document.getElementById('section-' + t).classList.replace('visible-block', 'hidden');
             });
@@ -793,8 +849,9 @@ HTML_TEMPLATE = """
 
             if(tab === 'admin') fetchAdminConfig();
             if(tab === 'customization') fetchCustomization();
-            if(tab === 'diagnostics' && document.getElementById('diag-results').innerHTML === "") {
+            if((tab === 'diagnostics' || tab === 'tracker') && document.getElementById('diag-results').innerHTML === "") {
                 document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
+                document.getElementById('tracker-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
             }
         }
 
@@ -848,37 +905,63 @@ HTML_TEMPLATE = """
         }
 
         async function runDiagnostics() {
-            const btn = document.getElementById('diag-btn');
-            const resDiv = document.getElementById('diag-results');
-            btn.disabled = true;
-            btn.innerText = "Scanning...";
-            resDiv.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.6;'>Sending packets to Google...</div>";
+            const btn1 = document.getElementById('diag-btn');
+            const btn2 = document.getElementById('tracker-btn');
+            if(btn1) btn1.disabled = true;
+            if(btn2) btn2.disabled = true;
+            if(btn1) btn1.innerText = "Scanning...";
+            if(btn2) btn2.innerText = "Scanning...";
+            
+            const resDiv1 = document.getElementById('diag-results');
+            const resDiv2 = document.getElementById('tracker-results');
+            
+            resDiv1.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.6;'>Sending packets to Google...</div>";
+            resDiv2.innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.6;'>Sending packets to Google...</div>";
 
             try {
                 const res = await fetch('/api/diagnostics', { method: 'POST' });
                 if (!res.ok) throw new Error('Request failed');
                 const data = await res.json();
                 
-                resDiv.innerHTML = "";
-                data.results.forEach((node, index) => {
-                    const row = document.createElement('div');
-                    row.className = 'key-row';
-                    row.innerHTML = `
+                resDiv1.innerHTML = "";
+                resDiv2.innerHTML = "";
+                
+                data.results.forEach((node) => {
+                    // Standard Cluster Health Rendering
+                    const row1 = document.createElement('div');
+                    row1.className = 'key-row';
+                    row1.innerHTML = `
                         <div>
-                            <div class="key-name">Node ${index + 1}: ${node.key}</div>
+                            <div class="key-name">Node ${node.index}: ${node.masked_key}</div>
                             <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
                         </div>
                         <div class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
                             ${node.status}
                         </div>
                     `;
-                    resDiv.appendChild(row);
+                    resDiv1.appendChild(row1);
+                    
+                    // Key Tracker Rendering
+                    const row2 = document.createElement('div');
+                    row2.className = 'key-row';
+                    row2.innerHTML = `
+                        <div>
+                            <div class="key-name" style="color: #fff;">[ ${node.name} ]</div>
+                            <div style="font-family: monospace; font-size: 0.85rem; color: #cbd5e1; margin-top: 5px;">${node.masked_key}</div>
+                            <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
+                        </div>
+                        <div class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
+                            ${node.status}
+                        </div>
+                    `;
+                    resDiv2.appendChild(row2);
                 });
             } catch (e) {
-                resDiv.innerHTML = `<div style='padding: 20px; text-align: center; color: var(--danger);'>Diagnostic scan failed.</div>`;
+                resDiv1.innerHTML = `<div style='padding: 20px; text-align: center; color: var(--danger);'>Diagnostic scan failed.</div>`;
+                resDiv2.innerHTML = `<div style='padding: 20px; text-align: center; color: var(--danger);'>Diagnostic scan failed.</div>`;
             }
-            btn.innerText = "Initiate Deep Scan";
-            btn.disabled = false;
+            if(btn1) { btn1.innerText = "Initiate Deep Scan"; btn1.disabled = false; }
+            if(btn2) { btn2.innerText = "Scan Named Keys"; btn2.disabled = false; }
         }
 
         async function fetchAdminConfig() {
