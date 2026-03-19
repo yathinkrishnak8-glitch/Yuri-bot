@@ -11,6 +11,11 @@ import datetime
 import re
 import gc  # 🔴 RAM SAVER: Garbage Collector imported
 
+try:
+    import resource # For deep Linux/Render RAM tracking
+except ImportError:
+    resource = None
+
 # NEW GOOGLE SDK
 from google import genai
 from google.genai import types
@@ -55,10 +60,10 @@ async def init_db():
             'status_text': 'over the Matrix',
             'response_delay': '0',
             'engine_status': 'online',
-            'safety_hate': 'BLOCK_NONE',       # 🔴 RESTORED
-            'safety_harassment': 'BLOCK_NONE', # 🔴 RESTORED
-            'safety_explicit': 'BLOCK_NONE',   # 🔴 RESTORED
-            'safety_dangerous': 'BLOCK_NONE'   # 🔴 RESTORED
+            'safety_hate': 'BLOCK_NONE',
+            'safety_harassment': 'BLOCK_NONE',
+            'safety_explicit': 'BLOCK_NONE',
+            'safety_dangerous': 'BLOCK_NONE'
         }
         
         for k, v in defaults.items():
@@ -80,10 +85,13 @@ async def set_config(key: str, value: str):
         await db.commit()
 
 async def log_system_error(user: str, trace: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
-        await db.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
+            await db.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
+            await db.commit()
+    except Exception as e:
+        print(f"CRITICAL DB LOGGING ERROR: {e}")
 
 # -------------------- Smart Cluster Load Balancer --------------------
 class GeminiKeyManager:
@@ -120,7 +128,6 @@ class GeminiKeyManager:
         self.lock = asyncio.Lock()
         
     def get_dynamic_safety(self):
-        # Dynamically map the strings back into the strict enum required by the new SDK
         return [
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=getattr(types.HarmBlockThreshold, get_config('safety_hate', 'BLOCK_NONE'))),
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=getattr(types.HarmBlockThreshold, get_config('safety_harassment', 'BLOCK_NONE'))),
@@ -139,6 +146,7 @@ class GeminiKeyManager:
             
     async def run_diagnostics(self) -> list:
         results = []
+        now = time.time()
         for obj in self.key_objects:
             key = obj['key']
             masked_key = f"{key[:8]}•••••••••••••••••••••••••••••{key[-4:]}"
@@ -149,6 +157,7 @@ class GeminiKeyManager:
                 async with self.lock:
                     if key in self.dead_keys: self.dead_keys.remove(key)
                     self.key_cooldowns[key] = 0.0
+                    self.key_usage[key] = []
                 
                 results.append({
                     "index": obj['index'],
@@ -156,6 +165,7 @@ class GeminiKeyManager:
                     "masked_key": masked_key,
                     "status": "ONLINE",
                     "detail": "Healthy & Ready",
+                    "unlock_time": 0,
                     "color": "#10b981"
                 })
             except Exception as e:
@@ -169,13 +179,17 @@ class GeminiKeyManager:
                                 cooldown_time = float(match.group(1)) + 2.0
                         except: pass
                             
-                        self.key_cooldowns[key] = time.time() + cooldown_time
+                        unlock_epoch = now + cooldown_time
+                        self.key_cooldowns[key] = unlock_epoch
+                        self.key_usage[key] = []
+                        
                         results.append({
                             "index": obj['index'],
                             "name": obj['name'],
                             "masked_key": masked_key,
                             "status": "COOLDOWN",
-                            "detail": f"Rate Limited (Auto-Retry in {round(cooldown_time)}s)",
+                            "detail": f"Rate Limited",
+                            "unlock_time": unlock_epoch, 
                             "color": "#f59e0b"
                         })
                     else:
@@ -186,6 +200,7 @@ class GeminiKeyManager:
                             "masked_key": masked_key,
                             "status": "DEAD",
                             "detail": "Invalid / Forbidden / Deleted",
+                            "unlock_time": 0,
                             "color": "#ef4444"
                         })
         return results
@@ -243,7 +258,8 @@ class GeminiKeyManager:
                                     cooldown_time = float(match.group(1)) + 2.0
                             except: pass
                             self.key_cooldowns[key] = time.time() + cooldown_time
-                        elif "403" in error_msg or "401" in error_msg or "permission" in error_msg or "api_key_invalid" in error_msg:
+                            self.key_usage[key] = []
+                        elif "400" in error_msg or "403" in error_msg or "permission" in error_msg or "invalid" in error_msg:
                             self.dead_keys.add(key)
                     continue
                     
@@ -342,16 +358,19 @@ async def status_loop():
 @tasks.loop(hours=24)
 async def optimize_db():
     print("[SYS] Initiating Auto-Optimization & Memory Garbage Collection...")
-    async with aiosqlite.connect(DB_PATH) as db:
-        seven_days_ago = int(time.time()) - 604800
-        await db.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-        await db.commit()
-    
-    async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
-        await db_vac.execute("VACUUM")
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            seven_days_ago = int(time.time()) - 604800
+            await db.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
+            await db.commit()
         
-    collected = gc.collect()
-    print(f"[SYS] Optimization Complete. Database defragmented. Cleared {collected} dead objects from RAM.")
+        async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
+            await db_vac.execute("VACUUM")
+            
+        collected = gc.collect()
+        print(f"[SYS] Optimization Complete. Database defragmented. Cleared {collected} dead objects from RAM.")
+    except Exception as e:
+        print(f"[SYS] Optimization Error: {e}")
 
 @bot.event
 async def on_ready():
@@ -581,44 +600,36 @@ async def process_channel_buffer(channel_id):
     except Exception as e:
         error_msg_str = str(e)
         
-        if "429" in error_msg_str or "quota" in error_msg_str.lower() or "exhausted" in error_msg_str.lower():
-            try:
-                await msg_obj.reply("⏳ **System Cooldown:** The AI cluster has hit its rate limit. Please wait a few moments before sending another message.", mention_author=False)
-            except discord.Forbidden:
-                pass 
-        else:
-            try:
-                err_embed = discord.Embed(
-                    title="⚠️ SYSTEM ANOMALY DETECTED",
-                    description="An unexpected fatal error has occurred within the Apex Engine.\n\n📡 **Telemetry Sent:** The crash logs have been instantly transmitted to Master Admin **yaen**.\n🛠️ **Status:** Please standby. The issue will be patched shortly.",
-                    color=0xff0000
-                )
-                err_embed.set_footer(text="YoAI Auto-Recovery Protocol")
-                await msg_obj.reply(embed=err_embed, mention_author=False)
-            except discord.Forbidden:
-                pass 
+        # 🔴 RESTORED RAW HANDLER: No hiding API limits. Tells the chat AND dm's you.
+        try:
+            error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+            await msg_obj.reply(error_public, mention_author=False)
+        except discord.Forbidden:
+            pass 
+        
+        await log_system_error(str(author), error_msg_str)
+        
+        try:
+            app_info = await bot.application_info()
+            admin_user = app_info.owner
+            error_dm = (
+                f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                f"**Triggered By:** {author} (`{author.id}`)\n"
+                f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                f"**Error Trace:**\n```\n{error_msg_str}\n```"
+            )
+            await admin_user.send(error_dm)
+        except Exception as dm_error:
+            print(f"Failed to DM admin: {dm_error}")
             
-            await log_system_error(str(author), error_msg_str)
-            
-            try:
-                app_info = await bot.application_info()
-                admin_user = app_info.owner
-                error_dm = (
-                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                    f"**Triggered By:** {author} (`{author.id}`)\n"
-                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
-                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
-                )
-                await admin_user.send(error_dm)
-            except Exception as dm_error:
-                print(f"Failed to DM admin: {dm_error}")
     finally:
-        del data
-        del image_parts
-        del msg_obj
-        del channel
-        del author
-        del combined_content
+        # 🔴 SAFE CLEANUP: Prevents UnboundLocalError
+        if 'data' in locals(): del data
+        if 'image_parts' in locals(): del image_parts
+        if 'msg_obj' in locals(): del msg_obj
+        if 'channel' in locals(): del channel
+        if 'author' in locals(): del author
+        if 'combined_content' in locals(): del combined_content
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -733,7 +744,7 @@ HTML_TEMPLATE = """
 
         .accent-text { color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 15px var(--accent-glow); }
         
-        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-left: 4px solid var(--accent); }
+        #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-left: 4px solid var(--accent); overflow-y: auto; }
         .nav-tab { padding: 12px 15px; border-radius: 8px; cursor: pointer; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
         .nav-tab:hover { background: rgba(255,255,255,0.05); transform: translateX(5px); }
         .nav-tab.active { background: rgba(255, 42, 42, 0.15); border-color: rgba(255, 42, 42, 0.4); color: #fff; box-shadow: 0 0 20px rgba(255, 42, 42, 0.2); }
@@ -788,9 +799,12 @@ HTML_TEMPLATE = """
         
         .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
         .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 30px rgba(239, 68, 68, 0.6); }
+        .btn-success { background: rgba(16, 185, 129, 0.1); border: 1px solid var(--success); color: var(--success); }
+        .btn-success:hover { background: var(--success); color: #fff; box-shadow: 0 0 30px rgba(16, 185, 129, 0.6); }
+        
         .key-row { display: flex; justify-content: space-between; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); transition: background 0.3s; }
         .key-row:hover { background: rgba(255,255,255,0.02); }
-        .badge { padding: 6px 12px; border-radius: 6px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; }
+        .badge { padding: 6px 12px; border-radius: 6px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; transition: all 0.5s ease; }
 
         #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; justify-content: center; align-items: center; z-index: 1000; backdrop-filter: blur(20px); }
         .login-box { padding: 50px; text-align: center; width: 340px; border-top: 4px solid var(--accent); }
@@ -828,6 +842,7 @@ HTML_TEMPLATE = """
             <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
             <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
             <div class="nav-tab" id="tab-tracker" onclick="switchTab('tracker')">Key Tracker</div>
+            <div class="nav-tab" id="tab-trash" onclick="switchTab('trash')">System Janitor</div>
             <div class="nav-tab" id="tab-safety" onclick="switchTab('safety')">Safety Center</div>
             <div class="nav-tab" id="tab-errors" onclick="switchTab('errors')">Error Logs</div>
             <div class="nav-tab" id="tab-customization" onclick="switchTab('customization')">Customization</div>
@@ -884,6 +899,33 @@ HTML_TEMPLATE = """
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Track the exact status of your custom-named API keys. Format in Render: <code>Name:Key, Backup:Key2</code></p>
                     <button id="tracker-btn" onclick="runDiagnostics()">Scan Named Keys</button>
                     <div id="tracker-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 8px; border: 1px solid var(--glass-border);"></div>
+                </div>
+            </div>
+
+            <div id="section-trash" class="hidden">
+                <h1 class="accent-text">System Janitor & Trash Analyzer</h1>
+                <div class="stat-grid" style="margin-bottom: 25px;">
+                    <div class="card glass stat-box">
+                        <div class="stat-label">Allocated RAM</div>
+                        <div class="stat-value" id="sys-ram">-</div>
+                        <div class="stat-small">Megabytes</div>
+                    </div>
+                    <div class="card glass stat-box">
+                        <div class="stat-label">SQLite Size</div>
+                        <div class="stat-value" id="sys-db">-</div>
+                        <div class="stat-small">Kilobytes</div>
+                    </div>
+                </div>
+                
+                <div class="card glass">
+                    <h2 style="font-size: 1.2rem; margin-bottom: 15px;">Manual Memory Overrides</h2>
+                    <p style="font-size: 0.85rem; opacity: 0.6; margin-bottom: 25px;">Use these controls to forcefully purge dead objects from Python's memory buffer or defragment the SQLite database. Useful for preventing Render OOM crashes.</p>
+                    
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                        <button class="btn-success" onclick="forceSysGC()" id="btn-gc" style="flex: 1;">Force RAM Flush (GC)</button>
+                        <button onclick="forceSysVacuum()" id="btn-vacuum" style="flex: 1;">Defragment DB (Vacuum)</button>
+                    </div>
+                    <div id="sys-trash-logs" style="margin-top: 20px; font-family: monospace; font-size: 0.85rem; color: var(--accent);"></div>
                 </div>
             </div>
 
@@ -997,21 +1039,20 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        // 🔴 LIVE TERMINAL JAVASCRIPT LOGIC 🔴
         const bootSequence = [
             "[SYS] Apex Engine Initializing...",
             "[SYS] Matrix Connection Established.",
             "[SYS] CSS Liquid Glass Animations: MOUNTED.",
             "[SYS] Dynamic Safety Overrides: ONLINE.",
             "[SYS] Dynamic Key RPM Tracker: INITIALIZED.",
-            "[SYS] Message Debouncer: ACTIVE.",
-            "[SYS] SQLite Memory Bank: SECURED.",
+            "[SYS] Memory Garbage Collector: SECURED.",
             "[SYS] Standing by for incoming signals."
         ];
         
         let bootLine = 0;
         let lastQueryCount = 0;
         let configLoaded = false; 
+        let cooldownIntervals = {};
 
         function typeTerminalLine(text, callback) {
             const el = document.getElementById('log-content');
@@ -1047,7 +1088,7 @@ HTML_TEMPLATE = """
         }
 
         function switchTab(tab) {
-            ['telemetry', 'diagnostics', 'tracker', 'safety', 'errors', 'customization', 'admin'].forEach(t => {
+            ['telemetry', 'diagnostics', 'tracker', 'trash', 'safety', 'errors', 'customization', 'admin'].forEach(t => {
                 document.getElementById('tab-' + t).classList.remove('active');
                 let section = document.getElementById('section-' + t);
                 section.classList.replace('visible-block', 'hidden');
@@ -1065,6 +1106,7 @@ HTML_TEMPLATE = """
                 fetchConfig();
             }
             if(tab === 'errors') fetchErrors();
+            if(tab === 'trash') fetchSysInfo();
             if((tab === 'diagnostics' || tab === 'tracker') && document.getElementById('diag-results').innerHTML === "") {
                 document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
                 document.getElementById('tracker-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
@@ -1107,12 +1149,54 @@ HTML_TEMPLATE = """
                 }
                 lastQueryCount = data.total_queries;
                 
-                if(document.getElementById('tab-errors').classList.contains('active')){
-                    fetchErrors();
-                }
+                if(document.getElementById('tab-errors').classList.contains('active')) fetchErrors();
+                if(document.getElementById('tab-trash').classList.contains('active')) fetchSysInfo();
+                
             } catch (e) { console.log("Stats fetch error."); }
         }
         
+        async function fetchSysInfo() {
+            try {
+                const res = await fetch('/api/sys_info');
+                if (res.ok) {
+                    const data = await res.json();
+                    document.getElementById('sys-ram').innerText = data.mem_mb !== null ? data.mem_mb : "N/A";
+                    document.getElementById('sys-db').innerText = data.db_kb;
+                }
+            } catch (e) { console.log(e); }
+        }
+        
+        async function forceSysGC() {
+            const btn = document.getElementById('btn-gc');
+            btn.disabled = true;
+            btn.innerText = "Flushing RAM...";
+            try {
+                const res = await fetch('/api/sys_gc', { method: 'POST' });
+                const data = await res.json();
+                const log = document.getElementById('sys-trash-logs');
+                const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+                log.innerHTML = `[${time}] RAM Flush Complete. Annihilated ${data.collected} dead memory objects.`;
+                fetchSysInfo();
+            } catch(e) {}
+            btn.innerText = "Force RAM Flush (GC)";
+            btn.disabled = false;
+        }
+        
+        async function forceSysVacuum() {
+            const btn = document.getElementById('btn-vacuum');
+            btn.disabled = true;
+            btn.innerText = "Vacuuming...";
+            try {
+                await fetch('/api/sys_vacuum', { method: 'POST' });
+                const log = document.getElementById('sys-trash-logs');
+                const time = new Date().toLocaleTimeString('en-US', { hour12: false });
+                log.innerHTML = `[${time}] Database Vacuum Complete. SQLite sectors defragmented.`;
+                fetchSysInfo();
+            } catch(e) {}
+            btn.innerText = "Defragment DB (Vacuum)";
+            btn.disabled = false;
+        }
+
         async function fetchErrors() {
             try {
                 const res = await fetch('/api/errors');
@@ -1167,6 +1251,41 @@ HTML_TEMPLATE = """
             } catch (e) { console.log("Config fetch error."); }
         }
 
+        function startCooldownTimer(prefix, index, unlockTime) {
+            const detailId = `detail-${prefix}-${index}`;
+            const badgeId = `badge-${prefix}-${index}`;
+            
+            if (cooldownIntervals[`${prefix}-${index}`]) {
+                clearInterval(cooldownIntervals[`${prefix}-${index}`]);
+            }
+            
+            const timer = setInterval(() => {
+                const detailEl = document.getElementById(detailId);
+                const badgeEl = document.getElementById(badgeId);
+                
+                if (!detailEl || !badgeEl) {
+                    clearInterval(timer);
+                    return;
+                }
+                
+                const nowSec = Date.now() / 1000;
+                const timeLeft = Math.ceil(unlockTime - nowSec);
+                
+                if (timeLeft <= 0) {
+                    clearInterval(timer);
+                    detailEl.innerText = "Healthy & Ready";
+                    badgeEl.innerText = "ONLINE";
+                    badgeEl.style.background = "#10b98115";
+                    badgeEl.style.color = "#10b981";
+                    badgeEl.style.borderColor = "#10b98140";
+                } else {
+                    detailEl.innerText = `Rate Limited (Auto-Retry in ${timeLeft}s)`;
+                }
+            }, 1000);
+            
+            cooldownIntervals[`${prefix}-${index}`] = timer;
+        }
+
         async function runDiagnostics() {
             const btn1 = document.getElementById('diag-btn');
             const btn2 = document.getElementById('tracker-btn');
@@ -1174,6 +1293,9 @@ HTML_TEMPLATE = """
             if(btn2) btn2.disabled = true;
             if(btn1) btn1.innerText = "Scanning...";
             if(btn2) btn2.innerText = "Scanning...";
+            
+            Object.values(cooldownIntervals).forEach(clearInterval);
+            cooldownIntervals = {};
             
             const resDiv1 = document.getElementById('diag-results');
             const resDiv2 = document.getElementById('tracker-results');
@@ -1195,9 +1317,9 @@ HTML_TEMPLATE = """
                     row1.innerHTML = `
                         <div>
                             <div class="key-name">Node ${node.index}: ${node.masked_key}</div>
-                            <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
+                            <div id="detail-diag-${node.index}" style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
                         </div>
-                        <div class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
+                        <div id="badge-diag-${node.index}" class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
                             ${node.status}
                         </div>
                     `;
@@ -1209,13 +1331,18 @@ HTML_TEMPLATE = """
                         <div>
                             <div class="key-name" style="color: #fff;">[ ${node.name} ]</div>
                             <div style="font-family: monospace; font-size: 0.85rem; color: #cbd5e1; margin-top: 5px;">${node.masked_key}</div>
-                            <div style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
+                            <div id="detail-trk-${node.index}" style="font-size: 0.8rem; opacity: 0.5; margin-top: 5px;">${node.detail}</div>
                         </div>
-                        <div class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
+                        <div id="badge-trk-${node.index}" class="badge" style="background: ${node.color}15; color: ${node.color}; border: 1px solid ${node.color}40;">
                             ${node.status}
                         </div>
                     `;
                     resDiv2.appendChild(row2);
+                    
+                    if (node.status === "COOLDOWN" && node.unlock_time > 0) {
+                        startCooldownTimer('diag', node.index, node.unlock_time);
+                        startCooldownTimer('trk', node.index, node.unlock_time);
+                    }
                 });
             } catch (e) {
                 resDiv1.innerHTML = `<div style='padding: 20px; text-align: center; color: var(--danger);'>Diagnostic scan failed.</div>`;
@@ -1284,6 +1411,9 @@ HTML_TEMPLATE = """
             document.getElementById('log-content').innerHTML = ''; 
             bootLine = 0;
             configLoaded = false;
+            
+            Object.values(cooldownIntervals).forEach(clearInterval);
+            cooldownIntervals = {};
         }
 
         window.onload = async () => {
@@ -1336,6 +1466,31 @@ async def api_stats():
     current_model = get_config('current_model', 'gemini-2.5-flash-lite')
         
     return jsonify({"uptime": uptime_str, "total_queries": TOTAL_QUERIES, "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model})
+
+@app.route('/api/sys_info')
+async def api_sys_info():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    mem_mb = None
+    if resource:
+        mem_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        mem_mb = round(mem_kb / 1024.0, 2)
+    
+    try: db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
+    except: db_size_kb = 0
+    return jsonify(mem_mb=mem_mb, db_kb=db_size_kb)
+
+@app.route('/api/sys_gc', methods=['POST'])
+async def api_sys_gc():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    collected = gc.collect()
+    return jsonify(success=True, collected=collected)
+
+@app.route('/api/sys_vacuum', methods=['POST'])
+async def api_sys_vacuum():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    async with aiosqlite.connect(DB_PATH, isolation_level=None) as db:
+        await db.execute("VACUUM")
+    return jsonify(success=True)
 
 @app.route('/api/diagnostics', methods=['POST'])
 async def api_diagnostics():
