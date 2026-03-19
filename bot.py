@@ -1,9 +1,8 @@
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from flask import Flask, request, session, jsonify, render_template_string
-import threading
-import sqlite3
+from quart import Quart, request, session, jsonify, render_template_string
+import aiosqlite
 import os
 import random
 import time
@@ -18,8 +17,11 @@ from google.genai import types
 # -------------------- Configuration & Globals --------------------
 START_TIME = time.time()
 TOTAL_QUERIES = 0
-DB_LOCK = threading.Lock()
 DB_PATH = "yoai.db"
+
+CONFIG_CACHE = {}
+CHANNEL_BUFFERS = {}
+CHANNEL_TIMERS = {}
 
 GEMINI_KEYS = os.environ.get("GEMINI_API_KEYS", "").split(",")
 if not GEMINI_KEYS or GEMINI_KEYS == [""]:
@@ -29,57 +31,70 @@ FLASK_SECRET = os.environ.get("FLASK_SECRET", "yoai_persistent_secret_key_123")
 PORT = int(os.environ.get("PORT", 5000))
 
 # -------------------- Database Setup --------------------
-def init_db():
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
-        c.execute("""CREATE TABLE IF NOT EXISTS message_history (
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS allowed_channels (guild_id INTEGER, channel_id INTEGER, PRIMARY KEY (guild_id, channel_id))")
+        await db.execute("""CREATE TABLE IF NOT EXISTS message_history (
             channel_id INTEGER, message_id INTEGER PRIMARY KEY, author_id INTEGER,
             content TEXT, timestamp INTEGER
         )""")
-        # Base Configs
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('system_prompt', 'You are YoAI, a highly intelligent assistant.')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('current_model', 'gemini-2.5-flash-lite')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('global_personality', 'default')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_type', 'watching')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('status_text', 'over the Matrix')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('response_delay', '0')")
-        c.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('engine_status', 'online')")
-        conn.commit()
-        conn.close()
-
-init_db()
+        await db.execute("""CREATE TABLE IF NOT EXISTS system_errors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL,
+            user TEXT,
+            trace TEXT
+        )""")
+        
+        defaults = {
+            'system_prompt': 'You are YoAI, a highly intelligent assistant.',
+            'current_model': 'gemini-2.5-flash-lite',
+            'global_personality': 'default',
+            'status_type': 'watching',
+            'status_text': 'over the Matrix',
+            'response_delay': '0',
+            'engine_status': 'online',
+            'safety_hate': 'BLOCK_NONE',
+            'safety_harassment': 'BLOCK_NONE',
+            'safety_explicit': 'BLOCK_NONE',
+            'safety_dangerous': 'BLOCK_NONE'
+        }
+        
+        for k, v in defaults.items():
+            await db.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v))
+            
+        await db.commit()
+        
+        async with db.execute("SELECT key, value FROM config") as cursor:
+            async for row in cursor:
+                CONFIG_CACHE[row[0]] = row[1]
 
 def get_config(key: str, default: str) -> str:
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT value FROM config WHERE key=?", (key,))
-        res = c.fetchone()
-        conn.close()
-        return res[0] if res else default
+    return CONFIG_CACHE.get(key, default)
 
-def set_config(key: str, value: str):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
-        conn.close()
+async def set_config(key: str, value: str):
+    CONFIG_CACHE[key] = value
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value))
+        await db.commit()
+
+async def log_system_error(user: str, trace: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO system_errors (timestamp, user, trace) VALUES (?, ?, ?)", (time.time(), user, trace))
+        await db.execute("DELETE FROM system_errors WHERE id NOT IN (SELECT id FROM system_errors ORDER BY id DESC LIMIT 50)")
+        await db.commit()
 
 # -------------------- Smart Cluster Load Balancer --------------------
 class GeminiKeyManager:
     def __init__(self, keys: list):
         self.key_objects = []
+        self.key_mapping = {}
         self.all_keys = []
         
         for i, k in enumerate(keys):
             k = k.strip()
             if not k: continue
             
-            # Smart Parsing for the new Key Tracker Tab
             name = f"Node {i+1}"
             actual_key = k
             
@@ -93,21 +108,26 @@ class GeminiKeyManager:
                 'name': name,
                 'key': actual_key
             })
+            
+            self.key_mapping[actual_key] = f"{name} ({actual_key[:8]}...)"
             self.all_keys.append(actual_key)
             
         self.key_cooldowns = {k: 0.0 for k in self.all_keys}
+        self.key_usage = {k: [] for k in self.all_keys} # 🚀 Internal Stopwatch Tracker
+        self.current_key_idx = 0 # 🚀 Round-Robin Tracker
         self.dead_keys = set()
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
         
-        self.unrestricted_safety = [
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    def get_dynamic_safety(self):
+        return [
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=getattr(types.HarmBlockThreshold, get_config('safety_hate', 'BLOCK_NONE'))),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=getattr(types.HarmBlockThreshold, get_config('safety_harassment', 'BLOCK_NONE'))),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=getattr(types.HarmBlockThreshold, get_config('safety_explicit', 'BLOCK_NONE'))),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=getattr(types.HarmBlockThreshold, get_config('safety_dangerous', 'BLOCK_NONE'))),
         ]
     
-    def get_stats(self) -> dict:
-        with self.lock:
+    async def get_stats(self) -> dict:
+        async with self.lock:
             now = time.time()
             total = len(self.all_keys)
             dead = len(self.dead_keys)
@@ -115,7 +135,7 @@ class GeminiKeyManager:
             active = total - dead - cooldown
             return {"total": total, "active": active, "cooldown": cooldown, "dead": dead}
             
-    def run_diagnostics(self) -> list:
+    async def run_diagnostics(self) -> list:
         results = []
         for obj in self.key_objects:
             key = obj['key']
@@ -123,8 +143,8 @@ class GeminiKeyManager:
             
             try:
                 client = genai.Client(api_key=key)
-                client.models.generate_content(model='gemini-2.5-flash-lite', contents="ping")
-                with self.lock:
+                await client.aio.models.generate_content(model='gemini-2.5-flash-lite', contents="ping")
+                async with self.lock:
                     if key in self.dead_keys: self.dead_keys.remove(key)
                     self.key_cooldowns[key] = 0.0
                 
@@ -138,15 +158,22 @@ class GeminiKeyManager:
                 })
             except Exception as e:
                 error_msg = str(e).lower()
-                with self.lock:
+                async with self.lock:
                     if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
-                        self.key_cooldowns[key] = time.time() + 60.0
+                        cooldown_time = 60.0
+                        try:
+                            match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_msg)
+                            if match:
+                                cooldown_time = float(match.group(1)) + 2.0
+                        except: pass
+                            
+                        self.key_cooldowns[key] = time.time() + cooldown_time
                         results.append({
                             "index": obj['index'],
                             "name": obj['name'],
                             "masked_key": masked_key,
                             "status": "COOLDOWN",
-                            "detail": "Rate Limited / Quota Reached",
+                            "detail": f"Rate Limited (Auto-Retry in {round(cooldown_time)}s)",
                             "color": "#f59e0b"
                         })
                     else:
@@ -161,94 +188,117 @@ class GeminiKeyManager:
                         })
         return results
 
-    def generate_with_fallback(self, target_model: str, contents: list, system_instruction: str = None) -> str:
+    async def generate_with_fallback(self, target_model: str, contents: list, system_instruction: str = None) -> str:
         fallback_models = [target_model, 'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-2.5-pro']
         models_to_try = list(dict.fromkeys(fallback_models)) 
         last_error = None
+        dynamic_safety = self.get_dynamic_safety()
         
         for model_name in models_to_try:
-            with self.lock:
+            async with self.lock:
                 now = time.time()
-                available_keys = [k for k in self.all_keys if k not in self.dead_keys and self.key_cooldowns[k] <= now]
+                available_keys = []
+                
+                # 🚀 Internal Stopwatch: Clean out old timestamps & Auto-Bench keys
+                for k in self.all_keys:
+                    self.key_usage[k] = [ts for ts in self.key_usage[k] if now - ts < 60.0]
+                    if k not in self.dead_keys and self.key_cooldowns[k] <= now and len(self.key_usage[k]) < 14:
+                        available_keys.append(k)
+                
+                if not available_keys: 
+                    raise Exception("Cascade Failure: All keys are exhausted (RPM Limit) or dead. No healthy nodes left.")
+                
+                # 🚀 Perfect Round-Robin Logic
+                selected_keys = []
+                for _ in range(len(self.all_keys)):
+                    k = self.all_keys[self.current_key_idx % len(self.all_keys)]
+                    self.current_key_idx = (self.current_key_idx + 1) % len(self.all_keys)
+                    if k in available_keys:
+                        selected_keys.append(k)
             
-            if not available_keys: continue 
-            
-            random.shuffle(available_keys)
-            for key in available_keys:
+            for key in selected_keys:
                 try:
+                    async with self.lock:
+                        self.key_usage[key].append(time.time()) # Log the RPM usage
+
                     client = genai.Client(api_key=key)
                     config = types.GenerateContentConfig(
                         system_instruction=system_instruction if system_instruction else None,
-                        safety_settings=self.unrestricted_safety
+                        safety_settings=dynamic_safety
                     )
-                    response = client.models.generate_content(model=model_name, contents=contents, config=config)
+                    response = await client.aio.models.generate_content(model=model_name, contents=contents, config=config)
                     return response.text
                 except Exception as e:
                     last_error = e
                     error_msg = str(e).lower()
-                    print(f"⚠️ [Model: {model_name}] [Key: {key[:8]}...] Failed: {e}", flush=True)
-                    with self.lock:
+                    display_name = self.key_mapping.get(key, "Unknown Key")
+                    print(f"⚠️ [Model: {model_name}] [{display_name}] Failed: {e}", flush=True)
+                    
+                    async with self.lock:
                         if "429" in error_msg or "quota" in error_msg or "exhausted" in error_msg:
-                            self.key_cooldowns[key] = time.time() + 60.0
+                            cooldown_time = 60.0
+                            try:
+                                match = re.search(r'retry in (\d+(?:\.\d+)?)s', error_msg)
+                                if match:
+                                    cooldown_time = float(match.group(1)) + 2.0
+                            except: pass
+                            self.key_cooldowns[key] = time.time() + cooldown_time
                         elif "400" in error_msg or "403" in error_msg or "permission" in error_msg or "invalid" in error_msg:
                             self.dead_keys.add(key)
                     continue
-        raise last_error or Exception("Total cascade failure. All cluster keys are either dead or on cooldown.")
+                    
+        raise Exception(f"Cascade Failure Details: {str(last_error)}")
 
 key_manager = GeminiKeyManager(GEMINI_KEYS)
 
-# -------------------- Helper Functions --------------------
-def get_global_personality() -> str: return get_config('global_personality', 'default')
-def set_global_personality(preset: str): set_config('global_personality', preset)
+# -------------------- Background Memory Compression --------------------
+async def background_summarize(channel_id, oldest):
+    texts = [f"User ID {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
+    if not texts: return
+    
+    try:
+        summary_text = await key_manager.generate_with_fallback('gemini-2.5-flash-lite', [f"Summarize concisely:\n{chr(10).join(texts)}"])
+    except:
+        summary_text = "[Summary unavailable]"
+        
+    oldest_ids = [mid for mid, _, _, _ in oldest]
+    timestamp = oldest[0][3]
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
+        await db.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)", (channel_id, -1, summary_text, timestamp))
+        await db.commit()
 
-def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
+# -------------------- Helper Functions --------------------
+async def is_channel_allowed(guild_id: int, channel_id: int) -> bool:
     if guild_id is None: return True
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
-        result = c.fetchone()
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id)) as cursor:
+            result = await cursor.fetchone()
         return result is not None
 
-def toggle_channel(guild_id: int, channel_id: int, enable: bool):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
+async def toggle_channel(guild_id: int, channel_id: int, enable: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
         if enable:
-            c.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
+            await db.execute("INSERT OR IGNORE INTO allowed_channels (guild_id, channel_id) VALUES (?, ?)", (guild_id, channel_id))
         else:
-            c.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
-        conn.commit()
-        conn.close()
+            await db.execute("DELETE FROM allowed_channels WHERE guild_id=? AND channel_id=?", (guild_id, channel_id))
+        await db.commit()
 
-def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
+async def add_message_to_history(channel_id: int, message_id: int, author_id: int, content: str, timestamp: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, ?, ?, ?)",
                   (channel_id, message_id, author_id, content, timestamp))
-        c.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,))
-        count = c.fetchone()[0]
+        await db.commit()
         
-        if count > 20:
-            c.execute("""SELECT message_id, author_id, content, timestamp FROM message_history 
-                         WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10""", (channel_id,))
-            oldest = c.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM message_history WHERE channel_id=?", (channel_id,)) as cursor:
+            count = (await cursor.fetchone())[0]
+            
+        if count > 15:
+            async with db.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
+                oldest = await cursor.fetchall()
             if oldest:
-                texts = [f"User ID {aid}: {cnt}" for mid, aid, cnt, ts in oldest if aid != 0]
-                if texts:
-                    try:
-                        summary_text = key_manager.generate_with_fallback('gemini-2.5-flash-lite', [f"Summarize concisely:\n{chr(10).join(texts)}"])
-                    except:
-                        summary_text = "[Summary unavailable]"
-                    
-                    oldest_ids = [mid for mid, _, _, _ in oldest]
-                    c.execute(f"DELETE FROM message_history WHERE message_id IN ({','.join('?'*len(oldest_ids))})", oldest_ids)
-                    c.execute("INSERT INTO message_history (channel_id, message_id, author_id, content, timestamp) VALUES (?, ?, 0, ?, ?)",
-                              (channel_id, -1, summary_text, oldest[0][3])) 
-        conn.commit()
-        conn.close()
+                bot.loop.create_task(background_summarize(channel_id, oldest))
 
 def clean_discord_name(name: str) -> str:
     cleaned = "".join(c for c in name if c.isalnum() or c.isspace()).strip()
@@ -268,6 +318,7 @@ class YoAIBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
+        bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT, use_reloader=False))
 
 bot = YoAIBot()
 
@@ -291,22 +342,19 @@ async def status_loop():
 @tasks.loop(hours=24)
 async def optimize_db():
     print("[SYS] Initiating Auto-Optimization & Memory Garbage Collection...")
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
+    async with aiosqlite.connect(DB_PATH) as db:
         seven_days_ago = int(time.time()) - 604800
-        c.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
-        conn.commit()
-        conn.close()
-        
-        conn_vac = sqlite3.connect(DB_PATH, isolation_level=None)
-        conn_vac.execute("VACUUM")
-        conn_vac.close()
+        await db.execute("DELETE FROM message_history WHERE timestamp < ?", (seven_days_ago,))
+        await db.commit()
+    
+    async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
+        await db_vac.execute("VACUUM")
     print("[SYS] Optimization Complete. Database defragmented.")
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
+    await init_db() 
     if not status_loop.is_running(): status_loop.start()
     if not optimize_db.is_running(): optimize_db.start()
 
@@ -318,27 +366,35 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     guild = getattr(channel, 'guild', None)
     channel_id = channel.id
 
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("""SELECT author_id, content FROM message_history 
-                     WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 20""", (channel_id,))
-        history = c.fetchall()
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp DESC, message_id DESC LIMIT 10", (channel_id,)) as cursor:
+            history = await cursor.fetchall()
+            
+    history.reverse() # Back to chronological
     
-    context_str = "[SYSTEM: Below is the recent chat history for context]\n"
-    for aid, cnt in history:
+    # 🚀 The Token Diet: 3000 Char Limit
+    context_lines = []
+    current_chars = 0
+    
+    for aid, cnt in reversed(history):
         if aid == 0:
-            context_str += f"[System Summary]: {cnt}\n"
+            line = f"[System Summary]: {cnt}\n"
         else:
             user_obj = guild.get_member(aid) if guild else bot.get_user(aid)
             raw_name = user_obj.display_name if user_obj else f"User_{aid}"
             safe_name = clean_discord_name(raw_name)
-            context_str += f"{safe_name}: {cnt}\n"
+            line = f"{safe_name}: {cnt}\n"
             
-    current_safe_name = clean_discord_name(author.display_name)
-    
+        if current_chars + len(line) > 3000:
+            break
+        context_lines.insert(0, line)
+        current_chars += len(line)
+        
+    context_str = "[SYSTEM: Below is the recent chat history for context]\n"
+    context_str += "".join(context_lines)
     context_str += "[SYSTEM: End of history.]\n\n"
+    
+    current_safe_name = clean_discord_name(author.display_name)
     context_str += f"Reply directly to {current_safe_name}'s new message: {user_message}"
 
     payload = [context_str]
@@ -346,8 +402,7 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
         payload.extend(image_parts)
 
     system = get_config('system_prompt', 'You are YoAI.')
-    
-    personality = get_global_personality()
+    personality = get_config('global_personality', 'default')
     if personality != "default":
         system += f"\n\n[GLOBAL PERSONALITY OVERRIDE]: You must strictly follow this persona for ALL users: {personality}"
 
@@ -355,16 +410,19 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
 
     target_model = get_config('current_model', 'gemini-2.5-flash-lite')
     
-    return key_manager.generate_with_fallback(target_model, payload, system)
+    return await key_manager.generate_with_fallback(target_model, payload, system)
 
 # -------------------- Slash Commands --------------------
 
-@bot.tree.command(name="toggle", description="Toggle the YoAI Engine ON or OFF globally.")
+@bot.tree.command(name="toggle", description="[ADMIN] Toggle the YoAI Engine ON or OFF globally.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def toggle_cmd(interaction: discord.Interaction):
+    if interaction.user.id != 1285791141266063475:
+        return await interaction.response.send_message("⛔ **Access Denied:** Only Master Admin Yaen can use the global kill switch.", ephemeral=True)
+        
     current_status = get_config('engine_status', 'online')
     new_status = 'offline' if current_status == 'online' else 'online'
-    set_config('engine_status', new_status)
+    await set_config('engine_status', new_status)
     
     if new_status == 'offline':
         await interaction.response.send_message("🛑 **Engine Offline:** YoAI has been put to sleep. It will completely ignore all messages until toggled back on.", ephemeral=False)
@@ -376,7 +434,7 @@ async def toggle_cmd(interaction: discord.Interaction):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def time_cmd(interaction: discord.Interaction, seconds: int):
     seconds = max(0, seconds)
-    set_config('response_delay', str(seconds))
+    await set_config('response_delay', str(seconds))
     if seconds == 0:
         await interaction.response.send_message("⏱️ **Response Time:** Normal (Instant). YoAI will reply immediately.")
     else:
@@ -392,28 +450,25 @@ async def time_cmd(interaction: discord.Interaction, seconds: int):
     app_commands.Choice(name="Gemini 2.0 Pro Experimental (Heavy Reasoning)", value="gemini-2.0-pro-exp")
 ])
 async def model_cmd(interaction: discord.Interaction, model_name: app_commands.Choice[str]):
-    set_config('current_model', model_name.value)
+    await set_config('current_model', model_name.value)
     await interaction.response.send_message(f"🧠 **Model Switched:** YoAI is now powered by `{model_name.name}`.")
 
 @bot.tree.command(name="personality", description="Set a GLOBAL custom personality prompt")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def personality(interaction: discord.Interaction, prompt: str):
     if prompt.strip().lower() == "default":
-        set_global_personality("default")
+        await set_config('global_personality', 'default')
         await interaction.response.send_message("🌍 **Global Personality Reset:** YoAI has returned to default settings.")
     else:
-        set_global_personality(prompt.strip())
+        await set_config('global_personality', prompt.strip())
         await interaction.response.send_message(f"🌍 **Global Personality Updated:** YoAI will now act like this for everyone:\n`{prompt.strip()}`")
 
 @bot.tree.command(name="clear", description="Wipe YoAI's memory for the current channel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def clear_cmd(interaction: discord.Interaction):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
-        conn.commit()
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM message_history WHERE channel_id=?", (interaction.channel_id,))
+        await db.commit()
     await interaction.response.send_message("🧹 **Memory Wiped.** I have forgotten all recent context in this channel.")
 
 @bot.tree.command(name="memory", description="Ask YoAI to analyze and summarize what it remembers about this channel.")
@@ -423,12 +478,9 @@ async def memory_cmd(interaction: discord.Interaction):
     guild = interaction.guild
     channel_id = interaction.channel_id
     
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,))
-        history = c.fetchall()
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT author_id, content FROM message_history WHERE channel_id=? ORDER BY timestamp ASC", (channel_id,)) as cursor:
+            history = await cursor.fetchall()
         
     if not history:
         return await interaction.followup.send("🧠 Memory Bank is currently empty for this sector.")
@@ -448,7 +500,7 @@ async def memory_cmd(interaction: discord.Interaction):
     try:
         target_model = 'gemini-2.5-flash-lite'
         sys_inst = "You are a cybernetic memory archivist. Keep your report structured, analytical, and brief."
-        analysis = key_manager.generate_with_fallback(target_model, [analysis_prompt], sys_inst)
+        analysis = await key_manager.generate_with_fallback(target_model, [analysis_prompt], sys_inst)
         await interaction.followup.send(f"🧠 **Memory Bank Analysis Complete:**\n\n{analysis}")
     except Exception as e:
         await interaction.followup.send(f"⚠️ Memory extraction failed: {e}")
@@ -472,7 +524,7 @@ async def info(interaction: discord.Interaction):
     uptime_str = str(datetime.timedelta(seconds=uptime_seconds)).split(".")[0]
     current_model = get_config('current_model', 'gemini-2.5-flash-lite')
     
-    stats = key_manager.get_stats()
+    stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
     embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a)
@@ -487,16 +539,80 @@ async def info(interaction: discord.Interaction):
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 async def setchannel(interaction: discord.Interaction):
-    toggle_channel(interaction.guild_id, interaction.channel.id, True)
+    await toggle_channel(interaction.guild_id, interaction.channel.id, True)
     await interaction.response.send_message(f"⚙️ **Activated:** YoAI System is now automatically listening to {interaction.channel.mention}")
 
 @bot.tree.command(name="unsetchannel", description="Stop YoAI from automatically replying in this channel.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
 async def unsetchannel(interaction: discord.Interaction):
-    toggle_channel(interaction.guild_id, interaction.channel.id, False)
+    await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
 # -------------------- DM & Server Message Routing w/ Vision & Admin Error Handling --------------------
+
+async def process_channel_buffer(channel_id):
+    await asyncio.sleep(2.0) # 🚀 The Message Debouncer Window
+    if channel_id not in CHANNEL_BUFFERS: return
+    
+    data = CHANNEL_BUFFERS.pop(channel_id)
+    if channel_id in CHANNEL_TIMERS:
+        del CHANNEL_TIMERS[channel_id]
+        
+    channel = data['channel']
+    author = data['author']
+    msg_obj = data['message']
+    combined_content = "\n".join(data['content'])
+    image_parts = data['attachments']
+    
+    # Store the aggregated message block as one memory input
+    await add_message_to_history(channel_id, msg_obj.id, author.id, combined_content or "[Sent an Image]", int(msg_obj.created_at.timestamp()))
+    
+    try:
+        delay = float(get_config('response_delay', '0'))
+        
+        async with channel.typing():
+            if delay > 0:
+                await asyncio.sleep(delay)
+                
+            response = await generate_ai_response(channel, combined_content, author, image_parts)
+            for i in range(0, len(response), 2000):
+                await msg_obj.reply(response[i:i+2000], mention_author=False)
+                
+    except Exception as e:
+        error_msg_str = str(e)
+        
+        if "cascade" in error_msg_str.lower() or "exhausted" in error_msg_str.lower() or "429" in error_msg_str:
+            try:
+                await msg_obj.reply("⏳ **System Cooldown:** The AI cluster has hit its rate limit. Please wait a few moments before sending another message.", mention_author=False)
+            except discord.Forbidden:
+                pass 
+        else:
+            try:
+                err_embed = discord.Embed(
+                    title="⚠️ SYSTEM ANOMALY DETECTED",
+                    description="An unexpected fatal error has occurred within the Apex Engine.\n\n📡 **Telemetry Sent:** The crash logs have been instantly transmitted to Master Admin **yaen**.\n🛠️ **Status:** Please standby. The issue will be patched shortly.",
+                    color=0xff0000
+                )
+                err_embed.set_footer(text="YoAI Auto-Recovery Protocol")
+                await msg_obj.reply(embed=err_embed, mention_author=False)
+            except discord.Forbidden:
+                pass 
+            
+            await log_system_error(str(author), error_msg_str)
+            
+            try:
+                app_info = await bot.application_info()
+                admin_user = app_info.owner
+                error_dm = (
+                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
+                    f"**Triggered By:** {author} (`{author.id}`)\n"
+                    f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
+                    f"**Error Trace:**\n```\n{error_msg_str}\n```"
+                )
+                await admin_user.send(error_dm)
+            except Exception as dm_error:
+                print(f"Failed to DM admin: {dm_error}")
+
 @bot.event
 async def on_message(message: discord.Message):
     if not bot.user or message.author == bot.user: return
@@ -506,61 +622,44 @@ async def on_message(message: discord.Message):
 
     is_dm = message.guild is None
     is_mentioned = bot.user in message.mentions or f'<@{bot.user.id}>' in message.content or f'<@!{bot.user.id}>' in message.content
-    is_allowed = True if is_dm else is_channel_allowed(message.guild.id, message.channel.id)
+    is_allowed = True if is_dm else await is_channel_allowed(message.guild.id, message.channel.id)
 
     if is_dm or is_mentioned or is_allowed:
         clean_content = message.content.replace(f'<@{bot.user.id}>', '').replace(f'<@!{bot.user.id}>', '').strip()
         if not clean_content and not message.attachments: 
             clean_content = "Hello! You pinged me?"
 
-        add_message_to_history(
-            channel_id=message.channel.id, message_id=message.id,
-            author_id=message.author.id, content=clean_content or "[Sent an Image]",
-            timestamp=int(message.created_at.timestamp())
-        )
-
-        image_parts = []
+        channel_id = message.channel.id
+        if channel_id not in CHANNEL_BUFFERS:
+            CHANNEL_BUFFERS[channel_id] = {
+                'content': [],
+                'attachments': [],
+                'author': message.author,
+                'channel': message.channel,
+                'message': message
+            }
+            
+        if clean_content:
+            CHANNEL_BUFFERS[channel_id]['content'].append(clean_content)
+            
         if message.attachments:
             for att in message.attachments:
                 if att.content_type and att.content_type.startswith('image/'):
                     img_bytes = await att.read()
-                    image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
-
-        try:
-            delay = float(get_config('response_delay', '0'))
-            
-            async with message.channel.typing():
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                    CHANNEL_BUFFERS[channel_id]['attachments'].append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
                     
-                response = await generate_ai_response(message.channel, clean_content, message.author, image_parts)
-                for i in range(0, len(response), 2000):
-                    await message.reply(response[i:i+2000], mention_author=False)
-        except Exception as e:
-            try:
-                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
-                await message.reply(error_public, mention_author=False)
-            except discord.Forbidden:
-                pass 
+        CHANNEL_BUFFERS[channel_id]['message'] = message 
+        
+        if channel_id in CHANNEL_TIMERS:
+            CHANNEL_TIMERS[channel_id].cancel()
             
-            try:
-                app_info = await bot.application_info()
-                admin_user = app_info.owner
-                error_dm = (
-                    f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                    f"**Triggered By:** {message.author} (`{message.author.id}`)\n"
-                    f"**Location:** {message.channel.mention if message.guild else 'DMs'}\n"
-                    f"**Error Trace:**\n```\n{str(e)}\n```"
-                )
-                await admin_user.send(error_dm)
-            except Exception as dm_error:
-                print(f"Failed to DM admin: {dm_error}")
+        CHANNEL_TIMERS[channel_id] = bot.loop.create_task(process_channel_buffer(channel_id))
 
     await bot.process_commands(message)
 
-# -------------------- Flask Web Dashboard (Live CSS Terminal UI) --------------------
-flask_app = Flask(__name__)
-flask_app.secret_key = FLASK_SECRET
+# -------------------- Quart Web Dashboard (ANIMATED GLASS UI) --------------------
+app = Quart(__name__)
+app.secret_key = FLASK_SECRET
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -573,11 +672,11 @@ HTML_TEMPLATE = """
     <style>
         :root { 
             --bg-deep: #000000;
-            --glass: rgba(10, 10, 10, 0.5);
-            --glass-border: rgba(255, 255, 255, 0.05);
+            --glass: rgba(10, 10, 10, 0.4);
+            --glass-border: rgba(255, 255, 255, 0.1);
             --text-main: #f3f4f6;
             --accent: #ff2a2a;
-            --accent-glow: rgba(255, 42, 42, 0.4);
+            --accent-glow: rgba(255, 42, 42, 0.5);
             --danger: #ef4444;
             --success: #10b981;
             --warning: #f59e0b;
@@ -587,43 +686,70 @@ HTML_TEMPLATE = """
             height: 100vh; overflow: hidden; display: flex; background-color: var(--bg-deep);
         }
         
-        /* PURE CSS SATAN BLACK LIQUID ENGINE */
+        /* THE FLUID BACKGROUND ENGINE */
         #live-bg {
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: -2;
-            background: linear-gradient(120deg, #000000, #0a0000, #050000, #140000);
-            background-size: 300% 300%;
-            animation: liquidFlow 15s ease-in-out infinite;
+            background: linear-gradient(135deg, #000000, #0a0000, #050000, #180000);
+            background-size: 400% 400%;
+            animation: liquidFlow 20s ease-in-out infinite;
         }
         .orb {
-            position: fixed; border-radius: 50%; filter: blur(90px); z-index: -1;
-            animation: float 20s infinite ease-in-out alternate;
+            position: fixed; border-radius: 50%; filter: blur(100px); z-index: -1;
+            animation: float 25s infinite ease-in-out alternate;
         }
-        .orb-1 { width: 50vw; height: 50vw; background: rgba(255, 42, 42, 0.08); top: -10%; left: -10%; }
-        .orb-2 { width: 60vw; height: 60vw; background: rgba(150, 0, 0, 0.06); bottom: -20%; right: -10%; animation-delay: -5s; }
+        .orb-1 { width: 55vw; height: 55vw; background: rgba(255, 42, 42, 0.09); top: -10%; left: -10%; }
+        .orb-2 { width: 65vw; height: 65vw; background: rgba(200, 0, 0, 0.07); bottom: -20%; right: -10%; animation-delay: -5s; }
         
         @keyframes liquidFlow { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }
-        @keyframes float { 0% { transform: translate(0, 0) scale(1); } 100% { transform: translate(5vw, 10vh) scale(1.2); } }
+        @keyframes float { 0% { transform: translate(0, 0) scale(1); } 100% { transform: translate(5vw, 10vh) scale(1.1); } }
 
-        .glass { background: var(--glass); backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px); border: 1px solid var(--glass-border); border-radius: 8px; box-shadow: 0 15px 50px rgba(0,0,0,0.9); }
+        /* APPLE-STYLE GLASSMORPHISM */
+        .glass { 
+            background: var(--glass); 
+            backdrop-filter: blur(25px) saturate(120%); 
+            -webkit-backdrop-filter: blur(25px) saturate(120%); 
+            border: 1px solid var(--glass-border); 
+            border-radius: 12px; 
+            box-shadow: 0 15px 40px rgba(0,0,0,0.8); 
+            position: relative;
+            overflow: hidden;
+        }
+        /* Top specular reflection for glass */
+        .glass::before {
+            content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            pointer-events: none;
+        }
+
         .accent-text { color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 2px; text-shadow: 0 0 15px var(--accent-glow); }
         
         #nav { width: 260px; padding: 25px; display: flex; flex-direction: column; gap: 15px; z-index: 10; margin: 20px; border-left: 4px solid var(--accent); }
-        .nav-tab { padding: 12px 15px; border-radius: 4px; cursor: pointer; transition: 0.3s; font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
-        .nav-tab:hover { background: rgba(255,255,255,0.03); }
-        .nav-tab.active { background: rgba(255, 42, 42, 0.1); border-color: rgba(255, 42, 42, 0.3); color: #fff; }
+        .nav-tab { padding: 12px 15px; border-radius: 8px; cursor: pointer; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); font-weight: bold; text-transform: uppercase; letter-spacing: 1px; font-size: 0.9rem; border: 1px solid transparent; }
+        .nav-tab:hover { background: rgba(255,255,255,0.05); transform: translateX(5px); }
+        .nav-tab.active { background: rgba(255, 42, 42, 0.15); border-color: rgba(255, 42, 42, 0.4); color: #fff; box-shadow: 0 0 20px rgba(255, 42, 42, 0.2); }
 
-        #content { flex-grow: 1; padding: 40px 40px 40px 0; overflow-y: auto; z-index: 10; }
+        #content { flex-grow: 1; padding: 40px 40px 40px 0; overflow-y: auto; z-index: 10; perspective: 1000px; }
         
         @media (max-width: 768px) {
             body { flex-direction: column; }
-            #nav { width: auto; height: auto; flex-direction: row; flex-wrap: wrap; padding: 15px; margin: 0; justify-content: center; gap: 10px; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 8px 8px 0 0; border-top: 1px solid var(--glass-border); border-left: none; }
-            .nav-tab { padding: 8px 12px; font-size: 0.75rem; flex: 1 1 22%; text-align: center; }
-            #content { padding: 25px; padding-bottom: 160px; margin: 0; }
+            #nav { width: auto; height: auto; flex-direction: row; flex-wrap: wrap; padding: 15px; margin: 0; justify-content: center; gap: 8px; bottom: 0; position: fixed; left: 0; right: 0; border-radius: 16px 16px 0 0; border-top: 1px solid var(--glass-border); border-left: none; backdrop-filter: blur(30px); }
+            .nav-tab { padding: 8px 10px; font-size: 0.7rem; flex: 1 1 30%; text-align: center; }
+            .nav-tab:hover { transform: none; }
+            #content { padding: 25px; padding-bottom: 180px; margin: 0; }
             .hide-mobile { display: none; }
         }
 
         h1, h2 { margin-top: 0; }
-        .card { padding: 25px; margin-bottom: 25px; transition: 0.3s; }
+        
+        .card { 
+            padding: 25px; margin-bottom: 25px; 
+            transition: all 0.4s cubic-bezier(0.25, 0.8, 0.25, 1); 
+        }
+        .card:hover { 
+            transform: translateY(-4px); 
+            box-shadow: 0 20px 50px rgba(0,0,0,0.9), 0 0 20px rgba(255,42,42,0.1); 
+            border-color: rgba(255,255,255,0.2); 
+        }
         
         .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 20px; }
         .stat-box { text-align: center; padding: 30px 20px; }
@@ -631,35 +757,40 @@ HTML_TEMPLATE = """
         .stat-value { font-size: 3.5rem; font-weight: 300; margin-top: 10px; color: #fff; text-shadow: 0 0 20px rgba(255,255,255,0.1); }
         .stat-small { font-size: 1rem; opacity: 0.5; margin-top: 5px;}
         
-        /* 🔴 THE LIVE TERMINAL STYLES 🔴 */
-        #logs-container { max-height: 250px; overflow-y: auto; padding: 15px; background: rgba(0,0,0,0.7); border: 1px solid rgba(255,42,42,0.2); border-radius: 4px; box-shadow: inset 0 0 15px rgba(0,0,0,1); scroll-behavior: smooth; }
+        /* LIVE TERMINAL */
+        #logs-container, #error-logs-container { max-height: 250px; overflow-y: auto; padding: 15px; background: rgba(0,0,0,0.6); border: 1px solid rgba(255,42,42,0.2); border-radius: 8px; box-shadow: inset 0 0 20px rgba(0,0,0,1); scroll-behavior: smooth; }
         pre { color: #ff5555; font-family: 'Courier New', Courier, monospace; font-size: 0.95rem; line-height: 1.6; text-shadow: 0 0 8px rgba(255,42,42,0.4); margin: 0; white-space: pre-wrap; word-wrap: break-word; }
         .cursor { display: inline-block; width: 10px; height: 1.2em; background-color: var(--accent); vertical-align: middle; animation: blink 1s step-end infinite; box-shadow: 0 0 10px var(--accent); }
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 
         label { display: block; margin-bottom: 8px; font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; opacity: 0.7; }
         input[type="text"], input[type="password"], textarea, select { 
-            width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 4px; 
-            border: 1px solid rgba(255,255,255,0.05); background: rgba(0,0,0,0.8); color: white; 
-            outline: none; font-family: 'Space Grotesk'; font-size: 1rem; transition: 0.3s;
+            width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 20px; border-radius: 8px; 
+            border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.6); color: white; 
+            outline: none; font-family: 'Space Grotesk'; font-size: 1rem; transition: all 0.3s ease;
         }
-        input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 15px var(--accent-glow); }
+        input:focus, textarea:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 20px var(--accent-glow); background: rgba(0,0,0,0.8); }
         textarea { resize: vertical; min-height: 120px; }
         
-        button { padding: 15px 25px; border-radius: 4px; border: 1px solid rgba(255,42,42,0.3); background: rgba(255,42,42,0.1); color: #fff; font-weight: 700; text-transform: uppercase; cursor: pointer; transition: 0.3s; }
-        button:hover { background: var(--accent); box-shadow: 0 0 25px var(--accent-glow); }
-        button:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; border-color: #555; }
+        button { padding: 15px 25px; border-radius: 8px; border: 1px solid rgba(255,42,42,0.4); background: rgba(255,42,42,0.15); color: #fff; font-weight: 700; text-transform: uppercase; cursor: pointer; transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); letter-spacing: 1px; }
+        button:hover { background: var(--accent); box-shadow: 0 0 30px var(--accent-glow); transform: translateY(-2px); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; background: transparent; border-color: #555; transform: none; box-shadow: none; }
         
-        .btn-danger { background: rgba(239, 68, 68, 0.05); border: 1px solid var(--danger); color: var(--danger); }
-        .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 25px rgba(239, 68, 68, 0.5); }
-        .key-row { display: flex; justify-content: space-between; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.02); }
-        .badge { padding: 6px 12px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; }
+        .btn-danger { background: rgba(239, 68, 68, 0.1); border: 1px solid var(--danger); color: var(--danger); }
+        .btn-danger:hover { background: var(--danger); color: #fff; box-shadow: 0 0 30px rgba(239, 68, 68, 0.6); }
+        .key-row { display: flex; justify-content: space-between; padding: 15px; border-bottom: 1px solid rgba(255,255,255,0.05); transition: background 0.3s; }
+        .key-row:hover { background: rgba(255,255,255,0.02); }
+        .badge { padding: 6px 12px; border-radius: 6px; font-size: 0.8rem; font-weight: bold; text-transform: uppercase; }
 
-        #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; justify-content: center; align-items: center; z-index: 1000; }
+        #login-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); display: flex; justify-content: center; align-items: center; z-index: 1000; backdrop-filter: blur(20px); }
         .login-box { padding: 50px; text-align: center; width: 340px; border-top: 4px solid var(--accent); }
+        
+        /* FLUID TAB ANIMATIONS */
         .hidden { display: none !important; }
         .visible-flex { display: flex !important; }
         .visible-block { display: block !important; }
+        .animate-in { animation: slideFadeUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
+        @keyframes slideFadeUp { from { opacity: 0; transform: translateY(30px) scale(0.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
     </style>
 </head>
 <body>
@@ -687,6 +818,8 @@ HTML_TEMPLATE = """
             <div class="nav-tab active" id="tab-telemetry" onclick="switchTab('telemetry')">Telemetry</div>
             <div class="nav-tab" id="tab-diagnostics" onclick="switchTab('diagnostics')">Cluster Health</div>
             <div class="nav-tab" id="tab-tracker" onclick="switchTab('tracker')">Key Tracker</div>
+            <div class="nav-tab" id="tab-safety" onclick="switchTab('safety')">Safety Center</div>
+            <div class="nav-tab" id="tab-errors" onclick="switchTab('errors')">Error Logs</div>
             <div class="nav-tab" id="tab-customization" onclick="switchTab('customization')">Customization</div>
             <div class="nav-tab" id="tab-admin" onclick="switchTab('admin')">Admin Panel</div>
             
@@ -696,7 +829,7 @@ HTML_TEMPLATE = """
         </div>
 
         <div id="content">
-            <div id="section-telemetry" class="visible-block">
+            <div id="section-telemetry" class="visible-block animate-in">
                 <h1 class="accent-text">System Telemetry</h1>
                 <div class="stat-grid">
                     <div class="card glass stat-box">
@@ -731,7 +864,7 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Execute a high-performance ping across the load-balanced API array. Verifies the RPM and health of all connected Google nodes.</p>
                     <button id="diag-btn" onclick="runDiagnostics()">Initiate Deep Scan</button>
-                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
+                    <div id="diag-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 8px; border: 1px solid var(--glass-border);"></div>
                 </div>
             </div>
 
@@ -740,7 +873,69 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <p style="opacity: 0.7; margin-bottom: 20px; line-height: 1.6;">Track the exact status of your custom-named API keys. Format in Render: <code>Name:Key, Backup:Key2</code></p>
                     <button id="tracker-btn" onclick="runDiagnostics()">Scan Named Keys</button>
-                    <div id="tracker-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 4px; border: 1px solid var(--glass-border);"></div>
+                    <div id="tracker-results" style="margin-top: 30px; display: flex; flex-direction: column; background: rgba(0,0,0,0.5); border-radius: 8px; border: 1px solid var(--glass-border);"></div>
+                </div>
+            </div>
+
+            <div id="section-safety" class="hidden">
+                <h1 class="accent-text">Safety & Behavior Control</h1>
+                <div class="card glass">
+                    <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Google AI Harms Filters</h2>
+                    <p style="font-size: 0.85rem; opacity: 0.6; margin-bottom: 20px;">Dynamically control the strictness of the AI's internal censorship filters. Note: "BLOCK_NONE" completely removes restrictions.</p>
+                    
+                    <div class="stat-grid" style="gap: 15px;">
+                        <div>
+                            <label>Hate Speech</label>
+                            <select id="safety-hate">
+                                <option value="BLOCK_NONE">Block None (Uncensored)</option>
+                                <option value="BLOCK_ONLY_HIGH">Block Only High</option>
+                                <option value="BLOCK_MEDIUM_AND_ABOVE">Block Medium & Above</option>
+                                <option value="BLOCK_LOW_AND_ABOVE">Block Low & Above (Strict)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Harassment</label>
+                            <select id="safety-harass">
+                                <option value="BLOCK_NONE">Block None (Uncensored)</option>
+                                <option value="BLOCK_ONLY_HIGH">Block Only High</option>
+                                <option value="BLOCK_MEDIUM_AND_ABOVE">Block Medium & Above</option>
+                                <option value="BLOCK_LOW_AND_ABOVE">Block Low & Above (Strict)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Sexually Explicit</label>
+                            <select id="safety-explicit">
+                                <option value="BLOCK_NONE">Block None (Uncensored)</option>
+                                <option value="BLOCK_ONLY_HIGH">Block Only High</option>
+                                <option value="BLOCK_MEDIUM_AND_ABOVE">Block Medium & Above</option>
+                                <option value="BLOCK_LOW_AND_ABOVE">Block Low & Above (Strict)</option>
+                            </select>
+                        </div>
+                        <div>
+                            <label>Dangerous Content</label>
+                            <select id="safety-danger">
+                                <option value="BLOCK_NONE">Block None (Uncensored)</option>
+                                <option value="BLOCK_ONLY_HIGH">Block Only High</option>
+                                <option value="BLOCK_MEDIUM_AND_ABOVE">Block Medium & Above</option>
+                                <option value="BLOCK_LOW_AND_ABOVE">Block Low & Above (Strict)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button onclick="saveSafetyConfig()" style="margin-top: 15px;">Deploy Safety Filters</button>
+                    <span id="save-safety-status" style="margin-left: 15px; color: var(--success); display: none; font-weight: bold; text-shadow: 0 0 10px var(--success);">✅ Filters Synced!</span>
+                </div>
+            </div>
+
+            <div id="section-errors" class="hidden">
+                <h1 class="accent-text">System Error Logs</h1>
+                <div class="card glass">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <p style="opacity: 0.7; margin: 0;">Persistent crash and exception telemetry securely stored in the database.</p>
+                        <button class="btn-danger" style="padding: 8px 15px; font-size: 0.8rem;" onclick="clearErrors()">Purge Logs</button>
+                    </div>
+                    <div id="error-logs-container" style="max-height: 500px;">
+                        <div id="error-content"></div>
+                    </div>
                 </div>
             </div>
 
@@ -760,7 +955,7 @@ HTML_TEMPLATE = """
                     <label>Activity Description</label>
                     <input type="text" id="cust-status-text" placeholder="e.g. over the Matrix, the Rain...">
                     <button onclick="saveCustomization()">Push Update to Discord</button>
-                    <span id="save-cust-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Synced!</span>
+                    <span id="save-cust-status" style="margin-left: 15px; color: var(--success); display: none; font-weight: bold; text-shadow: 0 0 10px var(--success);">✅ Synced!</span>
                 </div>
             </div>
 
@@ -768,6 +963,7 @@ HTML_TEMPLATE = """
                 <h1 class="accent-text">Admin Control Panel</h1>
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; margin-bottom: 20px;">Core Matrix Directives</h2>
+                    <p style="font-size: 0.85rem; opacity: 0.6; margin-bottom: 20px;">This prompt is persistent and permanently locked into the database until you change it here.</p>
                     <label>Global System Prompt</label>
                     <textarea id="admin-prompt" placeholder="You are YoAI..."></textarea>
                     <label>Primary AI Engine Block</label>
@@ -779,7 +975,7 @@ HTML_TEMPLATE = """
                         <option value="gemini-2.0-pro-exp">Gemini 2.0 Pro Experimental (Reasoning)</option>
                     </select>
                     <button onclick="saveConfig()">Deploy Config</button>
-                    <span id="save-status" style="margin-left: 15px; color: var(--success); display: none;">✅ Saved!</span>
+                    <span id="save-status" style="margin-left: 15px; color: var(--success); display: none; font-weight: bold; text-shadow: 0 0 10px var(--success);">✅ Config Secured!</span>
                 </div>
                 <div class="card glass" style="border-color: rgba(239, 68, 68, 0.3);">
                     <h2 style="font-size: 1.2rem; color: var(--danger); margin-bottom: 10px;">Danger Zone</h2>
@@ -795,14 +991,17 @@ HTML_TEMPLATE = """
         const bootSequence = [
             "[SYS] Apex Engine Initializing...",
             "[SYS] Matrix Connection Established.",
-            "[SYS] Core Safety Overrides: UNSHACKLED.",
-            "[SYS] SQLite Memory Bank: MOUNTED.",
-            "[SYS] Loading V12 Neural Weights...",
+            "[SYS] CSS Liquid Glass Animations: MOUNTED.",
+            "[SYS] Dynamic Safety Overrides: ONLINE.",
+            "[SYS] Dynamic Key RPM Tracker: INITIALIZED.",
+            "[SYS] Message Debouncer: ACTIVE.",
+            "[SYS] SQLite Memory Bank: SECURED.",
             "[SYS] Standing by for incoming signals."
         ];
         
         let bootLine = 0;
         let lastQueryCount = 0;
+        let configLoaded = false;
 
         function typeTerminalLine(text, callback) {
             const el = document.getElementById('log-content');
@@ -814,9 +1013,9 @@ HTML_TEMPLATE = """
                     clearInterval(typeInterval);
                     el.innerHTML += "<br>";
                     document.getElementById('logs-container').scrollTop = document.getElementById('logs-container').scrollHeight;
-                    if(callback) setTimeout(callback, 300);
+                    if(callback) setTimeout(callback, 50);
                 }
-            }, 30); // Typing speed
+            }, 30); 
         }
 
         function runBootSequence() {
@@ -826,29 +1025,36 @@ HTML_TEMPLATE = """
             }
         }
 
-        // ------------------------------------
-
         function toggleUI(showDash) {
             document.getElementById('login-overlay').className = showDash ? 'glass hidden' : 'glass visible-flex';
             document.getElementById('dashboard-view').className = showDash ? 'visible-flex' : 'hidden';
             if(showDash) {
                 document.getElementById('dashboard-view').style.display = 'flex';
-                setTimeout(runBootSequence, 500); // Start typing when logged in
+                setTimeout(runBootSequence, 600); 
             } else {
                 document.getElementById('dashboard-view').style.display = 'none';
             }
         }
 
         function switchTab(tab) {
-            ['telemetry', 'diagnostics', 'tracker', 'customization', 'admin'].forEach(t => {
+            ['telemetry', 'diagnostics', 'tracker', 'safety', 'errors', 'customization', 'admin'].forEach(t => {
                 document.getElementById('tab-' + t).classList.remove('active');
-                document.getElementById('section-' + t).classList.replace('visible-block', 'hidden');
+                let section = document.getElementById('section-' + t);
+                section.classList.replace('visible-block', 'hidden');
+                section.classList.remove('animate-in'); 
             });
+            
             document.getElementById('tab-' + tab).classList.add('active');
-            document.getElementById('section-' + tab).classList.replace('hidden', 'visible-block');
+            let activeSection = document.getElementById('section-' + tab);
+            activeSection.classList.replace('hidden', 'visible-block');
+            
+            void activeSection.offsetWidth; 
+            activeSection.classList.add('animate-in');
 
-            if(tab === 'admin') fetchAdminConfig();
-            if(tab === 'customization') fetchCustomization();
+            if((tab === 'admin' || tab === 'safety' || tab === 'customization') && !configLoaded) {
+                fetchConfig();
+            }
+            if(tab === 'errors') fetchErrors();
             if((tab === 'diagnostics' || tab === 'tracker') && document.getElementById('diag-results').innerHTML === "") {
                 document.getElementById('diag-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
                 document.getElementById('tracker-results').innerHTML = "<div style='padding: 20px; text-align: center; opacity: 0.3;'>Awaiting scan initialization...</div>";
@@ -862,9 +1068,13 @@ HTML_TEMPLATE = """
                 toggleUI(true); 
                 fetchStats(); 
                 setInterval(fetchStats, 3000); 
-                fetchConfig();
+                fetchConfig(); 
             } 
-            else { document.getElementById('err').style.display = 'block'; }
+            else { 
+                const err = document.getElementById('err');
+                err.style.display = 'block';
+                err.animate([{transform: 'translateX(-5px)'}, {transform: 'translateX(5px)'}, {transform: 'translateX(0)'}], {duration: 300});
+            }
         }
 
         async function fetchStats() {
@@ -879,7 +1089,6 @@ HTML_TEMPLATE = """
                 document.getElementById('memory').innerText = data.active_memory_rows;
                 document.getElementById('db-size').innerText = data.db_size;
                 
-                // 🔴 LIVE TERMINAL UPDATE LOGIC 🔴
                 if (lastQueryCount !== 0 && data.total_queries > lastQueryCount) {
                     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
                     const diff = data.total_queries - lastQueryCount;
@@ -887,8 +1096,43 @@ HTML_TEMPLATE = """
                     document.getElementById('logs-container').scrollTop = document.getElementById('logs-container').scrollHeight;
                 }
                 lastQueryCount = data.total_queries;
-
+                
+                if(document.getElementById('tab-errors').classList.contains('active')){
+                    fetchErrors();
+                }
             } catch (e) { console.log("Stats fetch error."); }
+        }
+        
+        async function fetchErrors() {
+            try {
+                const res = await fetch('/api/errors');
+                if (res.ok) {
+                    const data = await res.json();
+                    const container = document.getElementById('error-content');
+                    
+                    if (data.errors.length === 0) {
+                        container.innerHTML = "<div style='text-align: center; color: var(--success); opacity: 0.7; padding: 20px;'>[SYS] No critical errors detected. System operating nominally.</div>";
+                        return;
+                    }
+                    
+                    let html = '';
+                    data.errors.forEach(e => {
+                        html += `
+                        <div style="margin-bottom: 15px; padding-bottom: 15px; border-bottom: 1px solid rgba(255,0,0,0.2);">
+                            <div style="color: var(--danger); font-weight: bold; font-family: monospace; font-size: 0.9rem;">[${e.time}] TRIGGERED BY: ${e.user}</div>
+                            <pre style="color: #ffb3b3; font-size: 0.85rem; margin-top: 5px; white-space: pre-wrap;">${e.trace}</pre>
+                        </div>`;
+                    });
+                    container.innerHTML = html;
+                }
+            } catch (e) { console.log("Error fetch failed"); }
+        }
+        
+        async function clearErrors() {
+            if(confirm("Purge all error logs permanently?")) {
+                await fetch('/api/clear_errors', { method: 'POST' });
+                fetchErrors();
+            }
         }
 
         async function fetchConfig() {
@@ -896,10 +1140,19 @@ HTML_TEMPLATE = """
                 const res = await fetch('/api/config');
                 if (res.ok) {
                     const data = await res.json();
+                    
                     document.getElementById('admin-prompt').value = data.system_prompt;
                     document.getElementById('admin-model').value = data.current_model;
+                    
                     document.getElementById('cust-status-type').value = data.status_type;
                     document.getElementById('cust-status-text').value = data.status_text;
+                    
+                    document.getElementById('safety-hate').value = data.safety_hate;
+                    document.getElementById('safety-harass').value = data.safety_harassment;
+                    document.getElementById('safety-explicit').value = data.safety_explicit;
+                    document.getElementById('safety-danger').value = data.safety_dangerous;
+                    
+                    configLoaded = true; 
                 }
             } catch (e) { console.log("Config fetch error."); }
         }
@@ -927,7 +1180,6 @@ HTML_TEMPLATE = """
                 resDiv2.innerHTML = "";
                 
                 data.results.forEach((node) => {
-                    // Standard Cluster Health Rendering
                     const row1 = document.createElement('div');
                     row1.className = 'key-row';
                     row1.innerHTML = `
@@ -941,7 +1193,6 @@ HTML_TEMPLATE = """
                     `;
                     resDiv1.appendChild(row1);
                     
-                    // Key Tracker Rendering
                     const row2 = document.createElement('div');
                     row2.className = 'key-row';
                     row2.innerHTML = `
@@ -964,24 +1215,6 @@ HTML_TEMPLATE = """
             if(btn2) { btn2.innerText = "Scan Named Keys"; btn2.disabled = false; }
         }
 
-        async function fetchAdminConfig() {
-            const res = await fetch('/api/config');
-            if (res.ok) {
-                const data = await res.json();
-                document.getElementById('admin-prompt').value = data.system_prompt;
-                document.getElementById('admin-model').value = data.current_model;
-            }
-        }
-        
-        async function fetchCustomization() {
-            const res = await fetch('/api/config');
-            if (res.ok) {
-                const data = await res.json();
-                document.getElementById('cust-status-type').value = data.status_type;
-                document.getElementById('cust-status-text').value = data.status_text;
-            }
-        }
-
         async function saveConfig() {
             const payload = {
                 system_prompt: document.getElementById('admin-prompt').value,
@@ -991,7 +1224,7 @@ HTML_TEMPLATE = """
             if (res.ok) {
                 const status = document.getElementById('save-status');
                 status.style.display = 'inline';
-                setTimeout(() => status.style.display = 'none', 2000);
+                setTimeout(() => status.style.display = 'none', 2500);
                 fetchStats(); 
             }
         }
@@ -1005,7 +1238,22 @@ HTML_TEMPLATE = """
             if (res.ok) {
                 const status = document.getElementById('save-cust-status');
                 status.style.display = 'inline';
-                setTimeout(() => status.style.display = 'none', 2000);
+                setTimeout(() => status.style.display = 'none', 2500);
+            }
+        }
+        
+        async function saveSafetyConfig() {
+            const payload = {
+                safety_hate: document.getElementById('safety-hate').value,
+                safety_harassment: document.getElementById('safety-harass').value,
+                safety_explicit: document.getElementById('safety-explicit').value,
+                safety_dangerous: document.getElementById('safety-danger').value
+            };
+            const res = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            if (res.ok) {
+                const status = document.getElementById('save-safety-status');
+                status.style.display = 'inline';
+                setTimeout(() => status.style.display = 'none', 2500);
             }
         }
 
@@ -1023,8 +1271,9 @@ HTML_TEMPLATE = """
             await fetch('/logout', { method: 'POST' });
             toggleUI(false); 
             document.getElementById('pwd').value = '';
-            document.getElementById('log-content').innerHTML = ''; // Reset terminal on logout
+            document.getElementById('log-content').innerHTML = ''; 
             bootLine = 0;
+            configLoaded = false;
         }
 
         window.onload = async () => {
@@ -1043,24 +1292,25 @@ HTML_TEMPLATE = """
 </html>
 """
 
-@flask_app.route('/')
-def index(): return render_template_string(HTML_TEMPLATE)
+@app.route('/')
+async def index(): 
+    return await render_template_string(HTML_TEMPLATE)
 
-@flask_app.route('/login', methods=['POST'])
-def login():
-    data = request.get_json()
+@app.route('/login', methods=['POST'])
+async def login():
+    data = await request.get_json()
     if data and data.get('password') == "mr_yaen":
         session['logged_in'] = True
         return jsonify(success=True)
     return jsonify(success=False), 401
 
-@flask_app.route('/logout', methods=['POST'])
-def logout():
+@app.route('/logout', methods=['POST'])
+async def logout():
     session.pop('logged_in', None)
     return jsonify(success=True)
 
-@flask_app.route('/api/stats')
-def api_stats():
+@app.route('/api/stats')
+async def api_stats():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
     
     uptime_seconds = int(time.time() - START_TIME)
@@ -1069,55 +1319,67 @@ def api_stats():
     try: db_size_kb = round(os.path.getsize(DB_PATH) / 1024, 1)
     except: db_size_kb = 0
     
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM message_history")
-        rows = c.fetchone()[0]
-        c.execute("SELECT value FROM config WHERE key='current_model'")
-        res = c.fetchone()
-        current_model = res[0] if res else "gemini-2.5-flash-lite"
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM message_history") as cursor:
+            rows = (await cursor.fetchone())[0]
+            
+    current_model = get_config('current_model', 'gemini-2.5-flash-lite')
         
     return jsonify({"uptime": uptime_str, "total_queries": TOTAL_QUERIES, "active_memory_rows": rows, "db_size": db_size_kb, "current_model": current_model})
 
-@flask_app.route('/api/diagnostics', methods=['POST'])
-def api_diagnostics():
+@app.route('/api/diagnostics', methods=['POST'])
+async def api_diagnostics():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    results = key_manager.run_diagnostics()
+    results = await key_manager.run_diagnostics()
     return jsonify(success=True, results=results)
 
-@flask_app.route('/api/config', methods=['GET', 'POST'])
-def api_config():
+@app.route('/api/config', methods=['GET', 'POST'])
+async def api_config():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
     
     if request.method == 'GET':
-        sys_prompt = get_config('system_prompt', 'You are YoAI, a highly intelligent assistant.')
-        model = get_config('current_model', 'gemini-2.5-flash-lite')
-        s_type = get_config('status_type', 'watching')
-        s_text = get_config('status_text', 'over the Matrix')
-        return jsonify({"system_prompt": sys_prompt, "current_model": model, "status_type": s_type, "status_text": s_text})
+        return jsonify({
+            "system_prompt": get_config('system_prompt', 'You are YoAI, a highly intelligent assistant.'),
+            "current_model": get_config('current_model', 'gemini-2.5-flash-lite'),
+            "status_type": get_config('status_type', 'watching'),
+            "status_text": get_config('status_text', 'over the Matrix'),
+            "safety_hate": get_config('safety_hate', 'BLOCK_NONE'),
+            "safety_harassment": get_config('safety_harassment', 'BLOCK_NONE'),
+            "safety_explicit": get_config('safety_explicit', 'BLOCK_NONE'),
+            "safety_dangerous": get_config('safety_dangerous', 'BLOCK_NONE')
+        })
     
     if request.method == 'POST':
-        data = request.get_json()
-        for k in ['system_prompt', 'current_model', 'status_type', 'status_text']:
-            if k in data: set_config(k, data[k])
+        data = await request.get_json()
+        for k in data:
+            await set_config(k, data[k])
         return jsonify(success=True)
 
-@flask_app.route('/api/nuke', methods=['POST'])
-def api_nuke():
+@app.route('/api/errors')
+async def api_errors():
     if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-        conn.execute("DELETE FROM message_history")
-        conn.commit()
-        conn.close()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT timestamp, user, trace FROM system_errors ORDER BY timestamp DESC") as cursor:
+            rows = await cursor.fetchall()
+    
+    errors = [{"time": datetime.datetime.fromtimestamp(r[0]).strftime('%Y-%m-%d %H:%M:%S'), "user": r[1], "trace": r[2]} for r in rows]
+    return jsonify(errors=errors)
+
+@app.route('/api/clear_errors', methods=['POST'])
+async def api_clear_errors():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM system_errors")
+        await db.commit()
     return jsonify(success=True)
 
-def run_flask():
-    flask_app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+@app.route('/api/nuke', methods=['POST'])
+async def api_nuke():
+    if not session.get('logged_in'): return jsonify(error="Unauthorized"), 401
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM message_history")
+        await db.commit()
+    return jsonify(success=True)
 
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
     bot.run(os.environ.get("DISCORD_BOT_TOKEN"))
