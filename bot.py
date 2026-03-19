@@ -55,10 +55,10 @@ async def init_db():
             'status_text': 'over the Matrix',
             'response_delay': '0',
             'engine_status': 'online',
-            'safety_hate': 'BLOCK_NONE',
-            'safety_harassment': 'BLOCK_NONE',
-            'safety_explicit': 'BLOCK_NONE',
-            'safety_dangerous': 'BLOCK_NONE'
+            'safety_hate': 'BLOCK_NONE',       # 🔴 RESTORED
+            'safety_harassment': 'BLOCK_NONE', # 🔴 RESTORED
+            'safety_explicit': 'BLOCK_NONE',   # 🔴 RESTORED
+            'safety_dangerous': 'BLOCK_NONE'   # 🔴 RESTORED
         }
         
         for k, v in defaults.items():
@@ -120,6 +120,7 @@ class GeminiKeyManager:
         self.lock = asyncio.Lock()
         
     def get_dynamic_safety(self):
+        # Dynamically map the strings back into the strict enum required by the new SDK
         return [
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=getattr(types.HarmBlockThreshold, get_config('safety_hate', 'BLOCK_NONE'))),
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=getattr(types.HarmBlockThreshold, get_config('safety_harassment', 'BLOCK_NONE'))),
@@ -242,7 +243,7 @@ class GeminiKeyManager:
                                     cooldown_time = float(match.group(1)) + 2.0
                             except: pass
                             self.key_cooldowns[key] = time.time() + cooldown_time
-                        elif "400" in error_msg or "403" in error_msg or "permission" in error_msg or "invalid" in error_msg:
+                        elif "403" in error_msg or "401" in error_msg or "permission" in error_msg or "api_key_invalid" in error_msg:
                             self.dead_keys.add(key)
                     continue
                     
@@ -317,7 +318,6 @@ class YoAIBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
-        # 🔴 BUG FIX: Removed 'use_reloader' as Quart.run_task doesn't accept it
         bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
 
 bot = YoAIBot()
@@ -350,7 +350,6 @@ async def optimize_db():
     async with aiosqlite.connect(DB_PATH, isolation_level=None) as db_vac:
         await db_vac.execute("VACUUM")
         
-    # 🔴 RAM SAVER: Force Python to empty all unreferenced memory
     collected = gc.collect()
     print(f"[SYS] Optimization Complete. Database defragmented. Cleared {collected} dead objects from RAM.")
 
@@ -582,7 +581,7 @@ async def process_channel_buffer(channel_id):
     except Exception as e:
         error_msg_str = str(e)
         
-        if "cascade" in error_msg_str.lower() or "exhausted" in error_msg_str.lower() or "429" in error_msg_str:
+        if "429" in error_msg_str or "quota" in error_msg_str.lower() or "exhausted" in error_msg_str.lower():
             try:
                 await msg_obj.reply("⏳ **System Cooldown:** The AI cluster has hit its rate limit. Please wait a few moments before sending another message.", mention_author=False)
             except discord.Forbidden:
@@ -614,7 +613,6 @@ async def process_channel_buffer(channel_id):
             except Exception as dm_error:
                 print(f"Failed to DM admin: {dm_error}")
     finally:
-        # 🔴 RAM SAVER: Explicitly delete heavy objects from RAM
         del data
         del image_parts
         del msg_obj
@@ -654,6 +652,10 @@ async def on_message(message: discord.Message):
         if message.attachments:
             for att in message.attachments:
                 if att.content_type and att.content_type.startswith('image/'):
+                    if att.size > 4 * 1024 * 1024:
+                        await message.reply("⚠️ Image too large. Please compress it under 4MB to save Engine Memory.", mention_author=False)
+                        continue
+                        
                     img_bytes = await att.read()
                     CHANNEL_BUFFERS[channel_id]['attachments'].append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
                     
