@@ -341,8 +341,7 @@ class YoAIBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        await self.tree.sync()
-        print(f"Synced commands for {self.user}")
+        print(f"[SYS] Matrix Sync bypassed on boot to prevent Cloudflare 1015 Bans. Use !sync to register commands.")
         await init_db()
         bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
 
@@ -383,6 +382,12 @@ async def on_ready():
     print(f"Logged in as {bot.user}")
     if not status_loop.is_running(): status_loop.start()
     if not optimize_db.is_running(): optimize_db.start()
+
+@bot.command(name="sync")
+async def sync_cmds(ctx):
+    if ctx.author.id != 1285791141266063475: return
+    await bot.tree.sync()
+    await ctx.send("✅ Slash commands manually synchronized to Discord API.")
 
 # -------------------- The AI Generator --------------------
 async def generate_ai_response(channel: discord.abc.Messageable, user_message: str, author: discord.User, image_parts: list = None) -> str:
@@ -454,7 +459,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.2", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 4.4", color=0xff2a2a, description="Advanced Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime_str, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -593,12 +598,13 @@ async def unsetchannel(interaction: discord.Interaction):
     await toggle_channel(interaction.guild_id, interaction.channel.id, False)
     await interaction.response.send_message(f"❌ **Deactivated:** YoAI System is no longer automatically listening to {interaction.channel.mention}")
 
-# -------------------- Direct On-Message Routing (Silent Crash Protocol) --------------------
+# -------------------- Clean On-Message Routing (No Double Execution) --------------------
 
 async def process_channel_buffer(channel_id):
     global LAST_ALERT_TIME
     
-    await asyncio.sleep(1.0) 
+    # 🔴 0.5s HYPER-DEBOUNCER
+    await asyncio.sleep(0.5) 
     if channel_id not in CHANNEL_BUFFERS: return
     
     data = CHANNEL_BUFFERS.pop(channel_id)
@@ -626,15 +632,18 @@ async def process_channel_buffer(channel_id):
                 
     except Exception as e:
         error_msg_str = str(e)
-        
-        # 🔴 SILENT CRASH: No public message sent to channel.
-        # Always log to Web Dashboard database
         await log_system_error(str(author), error_msg_str)
         
-        # 🔴 ANTI-SPAM SHIELD: Rate-limit Admin DMs to once every 15 seconds
+        # 🔴 THE "SAFE" PUBLIC ERROR: Protected by the 15-second anti-ban shield.
         now = time.time()
         if now - LAST_ALERT_TIME > 15.0:
             LAST_ALERT_TIME = now
+            try:
+                error_public = "There is an error.\nThe issue is sent to master admin yaen. The issue will be fixed soon, wait until yaen beats it up."
+                await msg_obj.reply(error_public, mention_author=False)
+            except discord.Forbidden:
+                pass 
+            
             try:
                 app_info = await bot.application_info()
                 admin_user = app_info.owner
@@ -658,8 +667,6 @@ async def process_channel_buffer(channel_id):
 
 @bot.event
 async def on_message(message: discord.Message):
-    global LAST_ALERT_TIME
-    
     if not bot.user or message.author == bot.user: return
     
     engine_status = get_config('engine_status', 'online')
@@ -674,10 +681,21 @@ async def on_message(message: discord.Message):
         if not clean_content and not message.attachments: 
             clean_content = "Hello! You pinged me?"
 
-        channel = message.channel
-        author = message.author
+        channel_id = message.channel.id
         
-        image_parts = []
+        # 🔴 ONLY ADD TO BUFFER (Removed the bug that caused double API calls)
+        if channel_id not in CHANNEL_BUFFERS:
+            CHANNEL_BUFFERS[channel_id] = {
+                'content': [],
+                'attachments': [],
+                'author': message.author,
+                'channel': message.channel,
+                'message': message
+            }
+            
+        if clean_content:
+            CHANNEL_BUFFERS[channel_id]['content'].append(clean_content)
+            
         if message.attachments:
             for att in message.attachments:
                 if att.content_type and att.content_type.startswith('image/'):
@@ -686,44 +704,14 @@ async def on_message(message: discord.Message):
                         continue
                         
                     img_bytes = await att.read()
-                    image_parts.append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
+                    CHANNEL_BUFFERS[channel_id]['attachments'].append(types.Part.from_bytes(data=img_bytes, mime_type=att.content_type))
                     
+        CHANNEL_BUFFERS[channel_id]['message'] = message 
         
-        try:
-            await add_message_to_history(channel.id, message.id, author.id, clean_content or "[Sent an Image]", int(message.created_at.timestamp()))
+        if channel_id in CHANNEL_TIMERS:
+            CHANNEL_TIMERS[channel_id].cancel()
             
-            delay = float(get_config('response_delay', '0'))
-            
-            async with channel.typing():
-                if delay > 0:
-                    await asyncio.sleep(delay)
-                    
-                response = await generate_ai_response(channel, clean_content, author, image_parts)
-                for i in range(0, len(response), 2000):
-                    await message.reply(response[i:i+2000], mention_author=False)
-                    
-        except Exception as e:
-            error_msg_str = str(e)
-            
-            # 🔴 SILENT CRASH: No public message sent to channel.
-            await log_system_error(str(author), error_msg_str)
-            
-            # 🔴 THE ANTI-SPAM SHIELD (Max 1 alert per 15 seconds)
-            now = time.time()
-            if now - LAST_ALERT_TIME > 15.0:
-                LAST_ALERT_TIME = now
-                try:
-                    app_info = await bot.application_info()
-                    admin_user = app_info.owner
-                    error_dm = (
-                        f"⚠️ **YoAI System Alert: Critical Failure** ⚠️\n"
-                        f"**Triggered By:** {author} (`{author.id}`)\n"
-                        f"**Location:** {channel.mention if hasattr(channel, 'mention') else 'DMs'}\n"
-                        f"**Error Trace:**\n```\n{error_msg_str}\n```"
-                    )
-                    await admin_user.send(error_dm)
-                except Exception as dm_error:
-                    print(f"Failed to DM admin: {dm_error}")
+        CHANNEL_TIMERS[channel_id] = bot.loop.create_task(process_channel_buffer(channel_id))
 
     await bot.process_commands(message)
 
@@ -1186,7 +1174,7 @@ HTML_TEMPLATE = """
                 <div class="card glass">
                     <h2 style="font-size: 1.2rem; border-bottom: 1px solid var(--glass-border); padding-bottom: 15px; margin-bottom: 20px;">Complete Feature List</h2>
                     <ul class="feature-list">
-                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous responses with strict DB lock prevention.</li>
+                        <li style="--anim-delay: 0.1s">⚡ <strong>Zero-Delay Direct Async Event Routing:</strong> Instantaneous 0.5s debouncer to catch messages perfectly without double-executing API calls.</li>
                         <li style="--anim-delay: 0.2s">⚖️ <strong>Round-Robin API Load Balancer:</strong> Flawlessly rotates Gemini keys to multiply RPM limits.</li>
                         <li style="--anim-delay: 0.3s">⏱️ <strong>Internal Stopwatch Tracking:</strong> Pre-emptively benches keys before Google triggers a Rate Limit.</li>
                         <li style="--anim-delay: 0.4s">🏎️ <strong>Supercar UI Gauges:</strong> Live CSS Tachometers visualizing RPM and RLPD in the Cockpit.</li>
@@ -1199,7 +1187,7 @@ HTML_TEMPLATE = """
                         <li style="--anim-delay: 1.1s">📸 <strong>Multi-Modal Vision Guard:</strong> Automatically rejects huge images (>4MB) from crashing the server.</li>
                         <li style="--anim-delay: 1.2s">🚨 <strong>Anti-Freeze API Shield:</strong> Forces a hard 30-second timeout on Google requests to prevent indefinite bot hangs.</li>
                         <li style="--anim-delay: 1.3s">🌐 <strong>Universal Add Command (/invite):</strong> Secure OAuth2 generation that automatically expels the bot if triggered inside an existing guild.</li>
-                        <li style="--anim-delay: 1.4s">🛡️ <strong>Anti-Spam Discord Guard (Silent Crash Protocol):</strong> Suppresses public error messages and rate-limits Admin DMs to guarantee zero Cloudflare IP bans.</li>
+                        <li style="--anim-delay: 1.4s">🛡️ <strong>Anti-Spam Discord Guard:</strong> Forces a 15-second cooldown on public crash alerts and Admin DMs to guarantee zero Cloudflare IP bans.</li>
                     </ul>
                 </div>
             </div>
