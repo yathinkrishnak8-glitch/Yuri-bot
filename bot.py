@@ -24,8 +24,6 @@ QUERY_TIMESTAMPS = []
 # Cloud PostgreSQL Pool
 DB_POOL = None
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    print("⚠️ WARNING: DATABASE_URL is missing! You must add your Supabase URL in Render.")
 
 # ASYNC TRAFFIC CONTROLLERS (Cloudflare 1015 Shields)
 ALERT_LOCK = asyncio.Lock()
@@ -266,7 +264,7 @@ class YoAIBot(commands.Bot):
 
     async def setup_hook(self):
         print(f"[SYS] Engine online. Boot Auto-Sync disabled. Use !sync to register slash commands.")
-        await init_db()
+        # DB is initialized separately now in main()
 
 bot = YoAIBot()
 
@@ -324,7 +322,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.0 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.1 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -761,36 +759,45 @@ async def api_nuke():
     async with DB_POOL.acquire() as conn: await conn.execute("DELETE FROM message_history")
     return jsonify(success=True)
 
-# -------------------- Survival Startup Logic --------------------
+# -------------------- Decoupled Survival Startup --------------------
 async def main():
     if not DATABASE_URL:
-        print("❌ FATAL: You did not add DATABASE_URL to Render Environment Variables. The bot will crash.")
+        print("❌ FATAL: DATABASE_URL missing. The bot will crash.")
         return
 
-    # 1. Immediate Port Bind (Keeps Render Happy)
-    print(f"[BOOT] Binding Dash to Port {PORT}...")
+    # 1. IMMEDIATE DASHBOARD BIND
+    print(f"[BOOT] Binding Dashboard to Port {PORT} instantly...")
     asyncio.create_task(app.run_task(host="0.0.0.0", port=PORT))
     
-    # 2. Wait 10s to let old Cloudflare limits expire
-    print("[BOOT] Cloudflare evasion cooldown (10s)...")
-    await asyncio.sleep(10)
+    # Let the dashboard breathe for 2 seconds so Render sees it's alive
+    await asyncio.sleep(2) 
+    print("[BOOT] Dashboard bound. Moving to Cloud Brain initialization...")
+
+    # 2. CONNECT TO SUPABASE
+    try:
+        await init_db()
+        print("[BOOT] ✅ Connected to Supabase Cloud Brain!")
+    except Exception as e:
+        print(f"⚠️ [DB INIT ERROR] Could not reach Supabase. Is the URL correct? Error: {e}")
     
-    # 3. Connect to Supabase
-    print("[BOOT] Connecting to Supabase Cloud Brain...")
-    await init_db()
+    # 3. CLOUDFLARE COOL DOWN
+    print("[BOOT] Waiting 15s to bypass Cloudflare rate limits...")
+    await asyncio.sleep(15)
     
-    # 4. Engine Start
-    print("[BOOT] Igniting Discord Connection...")
+    # 4. START DISCORD ENGINE
+    print("[BOOT] Igniting Discord Engine...")
     while True:
         try:
             await bot.start(os.environ.get("DISCORD_BOT_TOKEN"))
         except Exception as e:
             if "1015" in str(e) or "429" in str(e):
-                print("🛑 [BANNED] Waiting 60s for Cloudflare ban to lift...")
+                print("🛑 [BANNED] Discord blocked this IP. Waiting 60s...")
                 await asyncio.sleep(60)
             else:
-                print(f"⚠️ [CRASH] Restarting in 10s. Error: {e}")
+                print(f"⚠️ [CRASH] Bot crashed: {e}. Restarting in 10s...")
                 await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.create_task(main())
+    loop.run_forever()
