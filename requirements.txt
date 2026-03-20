@@ -1,5 +1,5 @@
-discord.py>=2.4.0
-google-genai
-audioop-lts
+discord.py
 quart
-aiosqlite
+asyncpg
+google-genai
+requests
