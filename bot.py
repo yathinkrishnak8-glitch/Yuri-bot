@@ -312,7 +312,8 @@ async def sync_cmds(ctx):
 class InfoView(discord.ui.View):
     def __init__(self):
         super().__init__()
-        self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai.onrender.com"))
+        # UPDATED DASHBOARD LINK
+        self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai-trio-apex.onrender.com"))
 
 @bot.tree.command(name="info", description="Bot statistics and control panel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
