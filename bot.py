@@ -264,7 +264,6 @@ class YoAIBot(commands.Bot):
 
     async def setup_hook(self):
         print(f"[SYS] Engine online. Boot Auto-Sync disabled. Use !sync to register slash commands.")
-        # DB is initialized separately now in main()
 
 bot = YoAIBot()
 
@@ -312,7 +311,6 @@ async def sync_cmds(ctx):
 class InfoView(discord.ui.View):
     def __init__(self):
         super().__init__()
-        # UPDATED DASHBOARD LINK
         self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai-trio-apex.onrender.com"))
 
 @bot.tree.command(name="info", description="Bot statistics and control panel.")
@@ -323,7 +321,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.1 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.2 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -352,12 +350,17 @@ async def toggle_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"⚙️ Engine is now **{new_status.upper()}**.")
     await status_loop()
 
-@bot.tree.command(name="time", description="Set artificial delay for responses.")
+@bot.tree.command(name="time", description="Set delay (0=Normal, >0=Delay, -1=Instant/No Debouncer).")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def time_cmd(interaction: discord.Interaction, seconds: int):
-    seconds = max(0, seconds)
     await set_config('response_delay', str(seconds))
-    await interaction.response.send_message(f"⏱️ Delay set to {seconds} seconds.")
+    if seconds < 0:
+        msg = "⚡ **Debouncer DISABLED.** Engine set to INSTANT response mode."
+    elif seconds == 0:
+        msg = "⏱️ Artificial delay removed. Normal debouncer (1.5s) active."
+    else:
+        msg = f"⏱️ Artificial delay set to {seconds} seconds."
+    await interaction.response.send_message(msg)
 
 @bot.tree.command(name="model", description="Change AI model.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -454,7 +457,15 @@ async def generate_ai_response(channel, user_message, author, image_parts=None):
 
 async def process_channel_buffer(channel_id):
     global LAST_ALERT_TIME
-    await asyncio.sleep(1.5) # The Debouncer
+    
+    # Check the dynamic delay setting instantly from memory
+    delay_setting = float(get_config('response_delay', '0'))
+    
+    # The Dynamic Debouncer
+    if delay_setting >= 0:
+        await asyncio.sleep(1.5) # Wait 1.5s normally to catch rapid messages
+    # If delay_setting is < 0 (e.g., -1), it skips the sleep and fires instantly!
+    
     if channel_id not in CHANNEL_BUFFERS: return
     data = CHANNEL_BUFFERS.pop(channel_id)
     if channel_id in CHANNEL_TIMERS: del CHANNEL_TIMERS[channel_id]
@@ -463,8 +474,9 @@ async def process_channel_buffer(channel_id):
         combined_content = "\n".join(data['content'])
         await add_message_to_history(channel_id, data['message'].id, data['author'].id, combined_content or "[Image]", int(time.time()))
         
-        delay = float(get_config('response_delay', '0'))
-        if delay > 0: await asyncio.sleep(delay)
+        # The Artificial Delay
+        if delay_setting > 0: 
+            await asyncio.sleep(delay_setting)
             
         response = await generate_ai_response(data['channel'], combined_content, data['author'], data['attachments'])
         for i in range(0, len(response), 2000):
