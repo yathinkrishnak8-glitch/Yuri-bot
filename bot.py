@@ -321,7 +321,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.2 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.3 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -811,6 +811,4 @@ async def main():
                 await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.create_task(main())
-    loop.run_forever()
+    asyncio.run(main())
