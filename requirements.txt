@@ -1,5 +1,4 @@
 discord.py
-quart
-asyncpg
+Quart
+aiosqlite
 google-genai
-requests
