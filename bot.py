@@ -314,7 +314,7 @@ async def add_message_to_history(channel_id: int, message_id: int, author_id: in
             async with db.execute("SELECT message_id, author_id, content, timestamp FROM message_history WHERE channel_id=? ORDER BY timestamp ASC, message_id ASC LIMIT 10", (channel_id,)) as cursor:
                 oldest = await cursor.fetchall()
             if oldest:
-                bot.loop.create_task(background_summarize(channel_id, oldest))
+                asyncio.create_task(background_summarize(channel_id, oldest))
 
 def clean_discord_name(name: str) -> str:
     cleaned = "".join(c for c in name if c.isalnum() or c.isspace()).strip()
@@ -334,7 +334,7 @@ class YoAIBot(commands.Bot):
     async def setup_hook(self):
         await self.tree.sync()
         print(f"Synced commands for {self.user}")
-        bot.loop.create_task(app.run_task(host="0.0.0.0", port=PORT))
+        # Dashboard boot removed from here to prevent Render timeout blocks
 
 bot = YoAIBot()
 
@@ -675,7 +675,7 @@ async def on_message(message: discord.Message):
         if channel_id in CHANNEL_TIMERS:
             CHANNEL_TIMERS[channel_id].cancel()
             
-        CHANNEL_TIMERS[channel_id] = bot.loop.create_task(process_channel_buffer(channel_id))
+        CHANNEL_TIMERS[channel_id] = asyncio.create_task(process_channel_buffer(channel_id))
 
     await bot.process_commands(message)
 
@@ -1552,25 +1552,32 @@ if __name__ == "__main__":
         print("[SYS] CRITICAL: DISCORD_BOT_TOKEN environment variable not set.")
         exit(1)
 
-    print("[SYS] Initiating Boot Sequence with Anti-Cloudflare Auto-Retry...")
-    
-    while True:
-        try:
-            bot.run(token)
-            # If bot.run() exits normally without throwing an exception, we break the loop
-            break
-        except discord.errors.HTTPException as e:
-            if e.status == 429:
-                print(f"⚠️ [CLOUDFLARE/IP BAN] HTTP 429 Too Many Requests detected.")
-            else:
-                print(f"⚠️ [DISCORD HTTP ERROR] Status {e.status}: {e}")
-            
-            print("⏳ Holding connection... Retrying in 60 seconds to let the IP ban lift.")
-            time.sleep(60)
-        except discord.errors.LoginFailure as e:
-            print(f"🛑 [LOGIN FAILURE] Invalid Token: {e}. Stopping boot sequence.")
-            break 
-        except Exception as e:
-            print(f"⚠️ [CRASH] Unexpected error during connection: {e}")
-            print("⏳ Retrying connection in 60 seconds...")
-            time.sleep(60)
+    # 🔴 INVERTED BOOT SEQUENCE: Dashboard starts immediately to satisfy Render, Bot starts in background.
+    @app.before_serving
+    async def start_discord_bot():
+        async def bot_runner():
+            print("[SYS] Initiating Discord Boot Sequence with Anti-Cloudflare Auto-Retry...")
+            while True:
+                try:
+                    await bot.start(token)
+                    break
+                except discord.errors.HTTPException as e:
+                    if getattr(e, 'status', 0) == 429:
+                        print(f"⚠️ [CLOUDFLARE/IP BAN] HTTP 429 Too Many Requests detected.")
+                    else:
+                        print(f"⚠️ [DISCORD HTTP ERROR] Status {getattr(e, 'status', 'Unknown')}: {e}")
+                    print("⏳ Holding connection... Retrying in 60 seconds to let the IP ban lift.")
+                    await asyncio.sleep(60)
+                except discord.errors.LoginFailure as e:
+                    print(f"🛑 [LOGIN FAILURE] Invalid Token: {e}. Stopping boot sequence.")
+                    break
+                except Exception as e:
+                    print(f"⚠️ [CRASH] Unexpected error during connection: {e}")
+                    print("⏳ Retrying connection in 60 seconds...")
+                    await asyncio.sleep(60)
+
+        # Spin up the bot safely inside the web server's event loop
+        asyncio.create_task(bot_runner())
+
+    print("[SYS] Firing up the Web Dashboard on port", PORT)
+    app.run(host="0.0.0.0", port=PORT)
