@@ -25,7 +25,7 @@ QUERY_TIMESTAMPS = []
 DB_POOL = None
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ASYNC TRAFFIC CONTROLLERS (Cloudflare 1015 Shields)
+# ASYNC TRAFFIC CONTROLLERS
 ALERT_LOCK = asyncio.Lock()
 LAST_ALERT_TIME = 0.0
 
@@ -44,11 +44,9 @@ PORT = int(os.environ.get("PORT", 5000))
 async def init_db():
     global DB_POOL
     if DB_POOL is None:
-        # Connect to Supabase
         DB_POOL = await asyncpg.create_pool(DATABASE_URL)
         
     async with DB_POOL.acquire() as conn:
-        # Build PostgreSQL Tables natively
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS allowed_channels (guild_id BIGINT, channel_id BIGINT, PRIMARY KEY (guild_id, channel_id));
@@ -211,7 +209,7 @@ async def background_summarize(channel_id, oldest):
         
     oldest_ids = [row['message_id'] for row in oldest]
     timestamp = oldest[0]['timestamp']
-    fake_msg_id = -int(time.time() * 1000) # Prevents Postgres ID Conflicts
+    fake_msg_id = -int(time.time() * 1000) 
     
     try:
         async with DB_POOL.acquire() as conn:
@@ -322,7 +320,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.3 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.4 (Zero-Delay)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -450,7 +448,7 @@ async def generate_ai_response(channel, user_message, author, image_parts=None):
     payload = [ctx_str]
     if image_parts: payload.extend(image_parts)
 
-    system = get_config('system_prompt', 'You are YoAI.')
+    system = get_config('system_prompt', 'You are YoAI, a highly intelligent assistant.')
     personality = get_config('global_personality', 'default')
     if personality != "default": system += f"\n[GLOBAL PERSONALITY]: {personality}"
     system += "\nCRITICAL: Respond DIRECTLY to the user. DO NOT output a chat transcript."
@@ -460,13 +458,10 @@ async def generate_ai_response(channel, user_message, author, image_parts=None):
 async def process_channel_buffer(channel_id):
     global LAST_ALERT_TIME
     
-    # Check the dynamic delay setting instantly from memory
     delay_setting = float(get_config('response_delay', '0'))
     
-    # The Dynamic Debouncer
     if delay_setting >= 0:
-        await asyncio.sleep(1.5) # Wait 1.5s normally to catch rapid messages
-    # If delay_setting is < 0 (e.g., -1), it skips the sleep and fires instantly!
+        await asyncio.sleep(1.5) 
     
     if channel_id not in CHANNEL_BUFFERS: return
     data = CHANNEL_BUFFERS.pop(channel_id)
@@ -476,7 +471,6 @@ async def process_channel_buffer(channel_id):
         combined_content = "\n".join(data['content'])
         await add_message_to_history(channel_id, data['message'].id, data['author'].id, combined_content or "[Image]", int(time.time()))
         
-        # The Artificial Delay
         if delay_setting > 0: 
             await asyncio.sleep(delay_setting)
             
@@ -774,43 +768,26 @@ async def api_nuke():
     async with DB_POOL.acquire() as conn: await conn.execute("DELETE FROM message_history")
     return jsonify(success=True)
 
-# -------------------- Decoupled Survival Startup --------------------
+# -------------------- Start Server Engine (No Delays) --------------------
 async def main():
     if not DATABASE_URL:
         print("❌ FATAL: DATABASE_URL missing. The bot will crash.")
         return
 
-    # 1. IMMEDIATE DASHBOARD BIND
     print(f"[BOOT] Binding Dashboard to Port {PORT} instantly...")
     asyncio.create_task(app.run_task(host="0.0.0.0", port=PORT))
     
-    # Let the dashboard breathe for 2 seconds so Render sees it's alive
-    await asyncio.sleep(2) 
-    print("[BOOT] Dashboard bound. Moving to Cloud Brain initialization...")
+    await asyncio.sleep(1) # Tiny 1-second breather for Quart
+    print("[BOOT] Dashboard bound. Connecting to Cloud Brain...")
 
-    # 2. CONNECT TO SUPABASE
     try:
         await init_db()
         print("[BOOT] ✅ Connected to Supabase Cloud Brain!")
     except Exception as e:
-        print(f"⚠️ [DB INIT ERROR] Could not reach Supabase. Is the URL correct? Error: {e}")
+        print(f"⚠️ [DB INIT ERROR] Could not reach Supabase. Error: {e}")
     
-    # 3. CLOUDFLARE COOL DOWN
-    print("[BOOT] Waiting 15s to bypass Cloudflare rate limits...")
-    await asyncio.sleep(15)
-    
-    # 4. START DISCORD ENGINE
-    print("[BOOT] Igniting Discord Engine...")
-    while True:
-        try:
-            await bot.start(os.environ.get("DISCORD_BOT_TOKEN"))
-        except Exception as e:
-            if "1015" in str(e) or "429" in str(e):
-                print("🛑 [BANNED] Discord blocked this IP. Waiting 60s...")
-                await asyncio.sleep(60)
-            else:
-                print(f"⚠️ [CRASH] Bot crashed: {e}. Restarting in 10s...")
-                await asyncio.sleep(10)
+    print("[BOOT] Igniting Discord Engine (No Delays)...")
+    await bot.start(os.environ.get("DISCORD_BOT_TOKEN"))
 
 if __name__ == "__main__":
     asyncio.run(main())
