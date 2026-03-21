@@ -24,6 +24,8 @@ QUERY_TIMESTAMPS = []
 # Cloud PostgreSQL Pool
 DB_POOL = None
 DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    print("⚠️ WARNING: DATABASE_URL is missing! You must add your Supabase URL in Render.")
 
 # ASYNC TRAFFIC CONTROLLERS (Cloudflare 1015 Shields)
 ALERT_LOCK = asyncio.Lock()
@@ -264,6 +266,7 @@ class YoAIBot(commands.Bot):
 
     async def setup_hook(self):
         print(f"[SYS] Engine online. Boot Auto-Sync disabled. Use !sync to register slash commands.")
+        await init_db()
 
 bot = YoAIBot()
 
@@ -311,7 +314,7 @@ async def sync_cmds(ctx):
 class InfoView(discord.ui.View):
     def __init__(self):
         super().__init__()
-        self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai-trio-apex.onrender.com"))
+        self.add_item(discord.ui.Button(label="Open Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai.onrender.com"))
 
 @bot.tree.command(name="info", description="Bot statistics and control panel.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -321,7 +324,7 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.3 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
+    embed = discord.Embed(title="🏎️ YoAI | Apex Engine 7.0 (Postgres)", color=0xff2a2a, description="Cloud-Brain Asynchronous Matrix System")
     embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="Uptime", value=uptime, inline=True)
     embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
@@ -350,17 +353,12 @@ async def toggle_cmd(interaction: discord.Interaction):
     await interaction.response.send_message(f"⚙️ Engine is now **{new_status.upper()}**.")
     await status_loop()
 
-@bot.tree.command(name="time", description="Set delay (0=Normal, >0=Delay, -1=Instant/No Debouncer).")
+@bot.tree.command(name="time", description="Set artificial delay for responses.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def time_cmd(interaction: discord.Interaction, seconds: int):
+    seconds = max(0, seconds)
     await set_config('response_delay', str(seconds))
-    if seconds < 0:
-        msg = "⚡ **Debouncer DISABLED.** Engine set to INSTANT response mode."
-    elif seconds == 0:
-        msg = "⏱️ Artificial delay removed. Normal debouncer (1.5s) active."
-    else:
-        msg = f"⏱️ Artificial delay set to {seconds} seconds."
-    await interaction.response.send_message(msg)
+    await interaction.response.send_message(f"⏱️ Delay set to {seconds} seconds.")
 
 @bot.tree.command(name="model", description="Change AI model.")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
@@ -457,15 +455,7 @@ async def generate_ai_response(channel, user_message, author, image_parts=None):
 
 async def process_channel_buffer(channel_id):
     global LAST_ALERT_TIME
-    
-    # Check the dynamic delay setting instantly from memory
-    delay_setting = float(get_config('response_delay', '0'))
-    
-    # The Dynamic Debouncer
-    if delay_setting >= 0:
-        await asyncio.sleep(1.5) # Wait 1.5s normally to catch rapid messages
-    # If delay_setting is < 0 (e.g., -1), it skips the sleep and fires instantly!
-    
+    await asyncio.sleep(1.5) # The Debouncer
     if channel_id not in CHANNEL_BUFFERS: return
     data = CHANNEL_BUFFERS.pop(channel_id)
     if channel_id in CHANNEL_TIMERS: del CHANNEL_TIMERS[channel_id]
@@ -474,9 +464,8 @@ async def process_channel_buffer(channel_id):
         combined_content = "\n".join(data['content'])
         await add_message_to_history(channel_id, data['message'].id, data['author'].id, combined_content or "[Image]", int(time.time()))
         
-        # The Artificial Delay
-        if delay_setting > 0: 
-            await asyncio.sleep(delay_setting)
+        delay = float(get_config('response_delay', '0'))
+        if delay > 0: await asyncio.sleep(delay)
             
         response = await generate_ai_response(data['channel'], combined_content, data['author'], data['attachments'])
         for i in range(0, len(response), 2000):
@@ -772,42 +761,35 @@ async def api_nuke():
     async with DB_POOL.acquire() as conn: await conn.execute("DELETE FROM message_history")
     return jsonify(success=True)
 
-# -------------------- Decoupled Survival Startup --------------------
+# -------------------- Survival Startup Logic --------------------
 async def main():
     if not DATABASE_URL:
-        print("❌ FATAL: DATABASE_URL missing. The bot will crash.")
+        print("❌ FATAL: You did not add DATABASE_URL to Render Environment Variables. The bot will crash.")
         return
 
-    # 1. IMMEDIATE DASHBOARD BIND
-    print(f"[BOOT] Binding Dashboard to Port {PORT} instantly...")
+    # 1. Immediate Port Bind (Keeps Render Happy)
+    print(f"[BOOT] Binding Dash to Port {PORT}...")
     asyncio.create_task(app.run_task(host="0.0.0.0", port=PORT))
     
-    # Let the dashboard breathe for 2 seconds so Render sees it's alive
-    await asyncio.sleep(2) 
-    print("[BOOT] Dashboard bound. Moving to Cloud Brain initialization...")
-
-    # 2. CONNECT TO SUPABASE
-    try:
-        await init_db()
-        print("[BOOT] ✅ Connected to Supabase Cloud Brain!")
-    except Exception as e:
-        print(f"⚠️ [DB INIT ERROR] Could not reach Supabase. Is the URL correct? Error: {e}")
+    # 2. Wait 10s to let old Cloudflare limits expire
+    print("[BOOT] Cloudflare evasion cooldown (10s)...")
+    await asyncio.sleep(10)
     
-    # 3. CLOUDFLARE COOL DOWN
-    print("[BOOT] Waiting 15s to bypass Cloudflare rate limits...")
-    await asyncio.sleep(15)
+    # 3. Connect to Supabase
+    print("[BOOT] Connecting to Supabase Cloud Brain...")
+    await init_db()
     
-    # 4. START DISCORD ENGINE
-    print("[BOOT] Igniting Discord Engine...")
+    # 4. Engine Start
+    print("[BOOT] Igniting Discord Connection...")
     while True:
         try:
             await bot.start(os.environ.get("DISCORD_BOT_TOKEN"))
         except Exception as e:
             if "1015" in str(e) or "429" in str(e):
-                print("🛑 [BANNED] Discord blocked this IP. Waiting 60s...")
+                print("🛑 [BANNED] Waiting 60s for Cloudflare ban to lift...")
                 await asyncio.sleep(60)
             else:
-                print(f"⚠️ [CRASH] Bot crashed: {e}. Restarting in 10s...")
+                print(f"⚠️ [CRASH] Restarting in 10s. Error: {e}")
                 await asyncio.sleep(10)
 
 if __name__ == "__main__":
