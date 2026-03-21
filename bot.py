@@ -1556,18 +1556,31 @@ if __name__ == "__main__":
     @app.before_serving
     async def start_discord_bot():
         async def bot_runner():
-            print("[SYS] Initiating Discord Boot Sequence with Anti-Cloudflare Auto-Retry...")
+            print("[SYS] Initiating Discord Boot Sequence with Advanced Exponential Backoff...")
+            
+            retry_count = 0
+            base_delay = 15  # Start with a shorter 15-second delay
+            max_delay = 300  # Cap the wait time at 5 minutes
+            
             while True:
                 try:
                     await bot.start(token)
-                    break
+                    break  # If bot connects, exit the loop
                 except discord.errors.HTTPException as e:
                     if getattr(e, 'status', 0) == 429:
                         print(f"⚠️ [CLOUDFLARE/IP BAN] HTTP 429 Too Many Requests detected.")
                     else:
                         print(f"⚠️ [DISCORD HTTP ERROR] Status {getattr(e, 'status', 'Unknown')}: {e}")
-                    print("⏳ Holding connection... Retrying in 60 seconds to let the IP ban lift.")
-                    await asyncio.sleep(60)
+                    
+                    # Exponential backoff with jitter
+                    wait_time = min(max_delay, (base_delay * (2 ** retry_count)))
+                    jitter = random.uniform(0, 0.3 * wait_time) # Add up to 30% randomness
+                    total_wait = round(wait_time + jitter, 1)
+                    
+                    print(f"⏳ Attempt {retry_count + 1} failed. Applying Jittered Backoff: Retrying in {total_wait} seconds...")
+                    await asyncio.sleep(total_wait)
+                    retry_count += 1
+                    
                 except discord.errors.LoginFailure as e:
                     print(f"🛑 [LOGIN FAILURE] Invalid Token: {e}. Stopping boot sequence.")
                     break
