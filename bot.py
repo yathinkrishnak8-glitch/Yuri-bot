@@ -432,6 +432,79 @@ async def generate_ai_response(channel: discord.abc.Messageable, user_message: s
     
     return await key_manager.generate_with_fallback(target_model, payload, system)
 
+# -------------------- UI Views --------------------
+class EngineInfoView(discord.ui.View):
+    def __init__(self, bot_instance):
+        super().__init__(timeout=None)
+        self.bot_instance = bot_instance
+        self.add_item(discord.ui.Button(label="🌐 Access Web Dashboard", style=discord.ButtonStyle.link, url="https://yoai-1.onrender.com"))
+
+    @discord.ui.button(label="📜 Team Credits", style=discord.ButtonStyle.primary, custom_id="yoai_team_credits")
+    async def show_credits(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # We use an array of embeds so everyone gets their own Profile Picture thumbnail!
+        embeds = []
+        
+        main_embed = discord.Embed(
+            title="✨ YoAI | Core Architects",
+            description="The neural network was forged by these individuals.\n*(System Note: Fetching live API telemetry...)*",
+            color=0x2b2d31
+        )
+        if self.bot_instance.user.display_avatar:
+            main_embed.set_thumbnail(url=self.bot_instance.user.display_avatar.url)
+        embeds.append(main_embed)
+        
+        team = [
+            {"name": "mr_yaen", "role": "👑 Master Developer", "color": 0xff2a2a},
+            {"name": "flores.mortui", "role": "🛠️ Senior Tester", "color": 0xf59e0b},
+            {"name": "darkest_race", "role": "🐛 Junior Tester", "color": 0x10b981}
+        ]
+
+        for t in team:
+            user_obj = None
+            if interaction.guild:
+                user_obj = discord.utils.get(interaction.guild.members, name=t["name"])
+            if not user_obj:
+                user_obj = discord.utils.get(self.bot_instance.get_all_members(), name=t["name"])
+            
+            member_embed = discord.Embed(color=t["color"])
+            
+            if user_obj:
+                global_name = user_obj.global_name or user_obj.name
+                creation_date = user_obj.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                
+                if hasattr(user_obj, 'joined_at') and user_obj.joined_at:
+                    joined_date = user_obj.joined_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+                    joined_str = f"**Server Join:** `{joined_date}`\n"
+                else:
+                    joined_str = ""
+
+                role_str = ""
+                if hasattr(user_obj, 'top_role') and user_obj.top_role.name != "@everyone":
+                    role_str = f"**Top Role:** `{user_obj.top_role.name}`\n"
+
+                details = (
+                    f"**Identity:** {user_obj.mention}\n"
+                    f"**Global Name:** `{global_name}`\n"
+                    f"**Network ID:** `{user_obj.id}`\n"
+                    f"**Account Created:** `{creation_date}`\n"
+                    f"{joined_str}{role_str}"
+                )
+                
+                member_embed.add_field(name=f"{t['role']} | {t['name']}", value=details, inline=False)
+                
+                # Assigning the individual profile picture to their specific embed block!
+                if user_obj.display_avatar:
+                    member_embed.set_thumbnail(url=user_obj.display_avatar.url)
+            else:
+                details = f"**Identity:** `@{t['name']}`\n*Target out of radar range (Not found in shared cache).*"
+                member_embed.add_field(name=f"{t['role']} | {t['name']}", value=details, inline=False)
+
+            embeds.append(member_embed)
+            
+        embeds[-1].set_footer(text="YoAI Development Protocol")
+        
+        await interaction.response.send_message(embeds=embeds, ephemeral=True)
+
 # -------------------- Slash Commands --------------------
 
 @bot.tree.command(name="toggle", description="[ADMIN] Toggle the YoAI Engine ON or OFF globally.")
@@ -537,6 +610,27 @@ async def hack(interaction: discord.Interaction, user: discord.User):
     await asyncio.sleep(1.5)
     await msg.edit(content=f"**[CLASSIFIED LEAK - {user.display_name}]**\n" + "\n".join([f"- `{s}`" for s in searches]))
 
+@bot.tree.command(name="target", description="Prank a user with a tactical targeting sequence.")
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def target_cmd(interaction: discord.Interaction, user: discord.User):
+    embed = discord.Embed(
+        title="⚠️ TARGET ACQUIRED ⚠️",
+        color=0x2b2d31  # Dark theme color
+    )
+    
+    # Injecting the user's profile picture into the top right of the embed!
+    if user.display_avatar:
+        embed.set_thumbnail(url=user.display_avatar.url)
+        
+    # Generate a fake IP address for the prank
+    fake_ip = f"{random.randint(11, 255)}.{random.randint(0, 255)}.*.*"
+    
+    embed.add_field(name="👤 Target Identity", value=f"**Username:** {user.name}\n**Network ID:**\n`{user.id}`", inline=False)
+    embed.add_field(name="🌐 Trace Route", value=f"**Locating Node...**\n**IP Address:** `{fake_ip}`\n**Status:** Intercepted", inline=False)
+    embed.add_field(name="🚀 Tactical Actions Deployed", value="✅ Calling SpaceX Orbital Strike Command...\n✅ Rerouting Wi-Fi to NSA servers...\n✅ Sending current coordinates to local cartel...\n✅ Activating web-camera silently...", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
 @bot.tree.command(name="info", description="Bot statistics")
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def info(interaction: discord.Interaction):
@@ -547,14 +641,21 @@ async def info(interaction: discord.Interaction):
     stats = await key_manager.get_stats()
     key_health = f"{stats['active']} Active | {stats['cooldown']} CD | {stats['dead']} Dead"
     
-    embed = discord.Embed(title="🏎️ YoAI | Apex Engine", color=0xff2a2a)
-    embed.add_field(name="Ping", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="Uptime", value=uptime_str, inline=True)
-    embed.add_field(name="Active Engine", value=f"`{current_model}`", inline=True)
-    embed.add_field(name="Cluster Health", value=f"`{key_health}`", inline=True)
-    embed.add_field(name="Total AI Queries", value=str(TOTAL_QUERIES), inline=True)
-    embed.set_footer(text="Smart Load Balancer Active")
-    await interaction.response.send_message(embed=embed)
+    embed = discord.Embed(
+        title="🏎️ YoAI | Apex Engine Status", 
+        description="System telemetry and cluster health overview.", 
+        color=0xff2a2a
+    )
+    embed.add_field(name="📡 Ping", value=f"`{round(bot.latency * 1000)}ms`", inline=True)
+    embed.add_field(name="⏱️ Uptime", value=f"`{uptime_str}`", inline=True)
+    embed.add_field(name="🧠 Active Engine", value=f"`{current_model}`", inline=False)
+    embed.add_field(name="🖥️ Cluster Health", value=f"`{key_health}`", inline=True)
+    embed.add_field(name="⚡ Total AI Queries", value=f"`{TOTAL_QUERIES}`", inline=True)
+    embed.set_footer(text="Smart Load Balancer Active • v2.0")
+    
+    view = EngineInfoView(bot)
+    
+    await interaction.response.send_message(embed=embed, view=view)
 
 @bot.tree.command(name="setchannel", description="Allow YoAI to automatically read & reply to ALL messages here.")
 @app_commands.allowed_contexts(guilds=True, dms=False, private_channels=False)
